@@ -166,7 +166,7 @@ func (f *FileContext) AckMsg(buf []byte) []byte {
 	i := f.tail
 	var (
 		partials []PartialAck
-		nseg int
+		nseg     int
 	)
 	for f.ncompleted-f.tail-nseg > 0 {
 		// search for first completed segment from tail
@@ -256,17 +256,114 @@ type WaitItem struct {
 	seqno  uint32
 }
 
+type RTOCalclater interface {
+	Update(rtt float64, rttTable []float64) time.Duration
+}
+
+type DoubleRTO struct {
+}
+
+func (r *DoubleRTO) Update(rtt float64, rttTable []float64) time.Duration {
+	if rtt == 0 {
+		return 200 * time.Millisecond
+	}
+	return time.Duration(rtt * 2)
+}
+
+type RTTCollecter struct {
+	table map[uint32]map[uint32]time.Time
+	rtt   float64
+	RTO   time.Duration
+
+	rttTable []float64
+	size     int
+	head     int
+
+	rtoCalc RTOCalclater
+}
+
+func newRTTCollecter(window int, rtoCalc RTOCalclater) *RTTCollecter {
+	rc := &RTTCollecter{
+		table:    make(map[uint32]map[uint32]time.Time),
+		rttTable: make([]float64, window),
+		rtoCalc:  rtoCalc,
+	}
+	rc.RTO = rtoCalc.Update(0, nil)
+	return rc
+}
+
+func (rc *RTTCollecter) Send(fileno, seqno uint32, t time.Time) {
+	file, ok := rc.table[fileno]
+	if !ok {
+		file = make(map[uint32]time.Time)
+		rc.table[fileno] = file
+	}
+	file[seqno] = t
+}
+
+func (rc *RTTCollecter) Recv(fileno, seqno uint32, t time.Time) {
+	if file, ok := rc.table[fileno]; !ok {
+		return
+	} else if st, ok := file[seqno]; !ok {
+		return
+	} else {
+		rtt := t.Sub(st)
+		rc.addRTT(float64(rtt))
+
+		// remove from table
+		delete(file, seqno)
+		if len(file) == 0 {
+			delete(rc.table, fileno)
+		}
+	}
+}
+
+func (rc *RTTCollecter) Remove(fileno, seqno uint32) {
+	if file, ok := rc.table[fileno]; !ok {
+		return
+	} else {
+		// remove from table
+		delete(file, seqno)
+		if len(file) == 0 {
+			delete(rc.table, fileno)
+		}
+	}
+}
+
+func (rc *RTTCollecter) addRTT(rtt float64) {
+	// queue into rttTable
+	if rc.size < len(rc.rttTable) {
+		rc.rttTable[rc.size] = rtt
+		sum := rc.rtt * float64(rc.size)
+		rc.size++
+		rc.rtt = (sum + rtt) / float64(rc.size)
+	} else {
+		rc.rtt -= rc.rttTable[rc.head] / float64(rc.size)
+		rc.rtt += rtt / float64(rc.size)
+		rc.rttTable[rc.head] = rtt
+		rc.head++
+		if rc.head == len(rc.rttTable) {
+			rc.head = 0
+		}
+	}
+
+	// calc RTO
+	rc.RTO = rc.rtoCalc.Update(rc.rtt, rc.rttTable[:rc.size])
+}
+
 type Sender struct {
 	segSize    uint16
 	chSendFile chan *FileContext
+	rtt        *RTTCollecter
 }
 
-func createSender(conn *net.UDPConn, mtu int) *Sender {
+func createSender(conn *net.UDPConn, mtu int, rtt *RTTCollecter) *Sender {
 	mss := uint16(mtu - IPHeaderLen - UDPHeaderLen)
 	segSize := uint16(mss - RobustPHeaderLen)
 	s := &Sender{
 		segSize:    segSize,
 		chSendFile: make(chan *FileContext),
+		rtt:        rtt,
 	}
 	chAck := make(chan AckMsg)
 	go s.recvThread(conn, chAck)
@@ -306,8 +403,6 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 	var timers []*WaitItem
 	buf := make([]byte, RobustPHeaderLen+s.segSize)
 
-	rto := time.Second
-
 	files := make(map[uint32]*FileContext)
 	timer := time.NewTimer(0)
 	timer.Stop()
@@ -316,7 +411,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 		chQueueFile <-chan *FileContext = s.chSendFile
 		queueFile   *FileContext
 		queueSeqno  int
-		window      = 1000
+		window      = 260
 		nsent       int
 	)
 
@@ -332,11 +427,13 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 				log.Panic(err)
 				return
 			}
+			now := time.Now()
 			timers = append(timers, &WaitItem{
-				sentat: time.Now(),
+				sentat: now,
 				fctx:   queueFile,
 				seqno:  uint32(queueSeqno),
 			})
+			s.rtt.Send(queueFile.fileno, uint32(queueSeqno), now)
 			nsent++
 		}
 		if queueSeqno >= len(queueFile.data) {
@@ -347,7 +444,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 		}
 		if restartTimer && len(timers) > 0 {
 			// reset timer
-			timer.Reset(timers[0].sentat.Add(rto).Sub(time.Now()))
+			timer.Reset(timers[0].sentat.Add(s.rtt.RTO).Sub(time.Now()))
 		}
 	}
 
@@ -365,6 +462,8 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 			} else {
 				nsent -= nack
 			}
+			// TODO: get time at exactly recv
+			s.rtt.Recv(ack.header.Fileno, ack.header.Seqno, time.Now())
 			if f.IsAllCompleted() {
 				log.Infof("send finished fileno %d\n", f.fileno)
 				delete(files, f.fileno)
@@ -372,10 +471,12 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 			queueFirst()
 
 		case now := <-timer.C:
-			for len(timers) > 0 && timers[0].sentat.Before(now) {
+			for len(timers) > 0 && timers[0].sentat.Add(s.rtt.RTO).Before(now) {
 				// pop item
 				item := timers[0]
 				timers = timers[1:]
+
+				s.rtt.Remove(item.fctx.fileno, item.seqno)
 
 				if !item.fctx.IsCompleted(item.seqno) {
 					log.Infof("timeout : fileno: %d, seqno: %d", item.fctx.fileno, item.seqno)
@@ -393,7 +494,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 			}
 			if len(timers) > 0 {
 				// reset timer
-				timer.Reset(timers[0].sentat.Add(rto).Sub(time.Now()))
+				timer.Reset(timers[0].sentat.Add(s.rtt.RTO).Sub(time.Now()))
 			}
 
 		case f := <-chQueueFile:
@@ -511,8 +612,10 @@ func main() {
 
 	log.Info("allocated")
 
+	rtt := newRTTCollecter(30, &DoubleRTO{})
+
 	// sender
-	sender := createSender(sendConn, 1500)
+	sender := createSender(sendConn, 1500, rtt)
 
 	receiver := createReceiver(recvConn, 1500)
 
