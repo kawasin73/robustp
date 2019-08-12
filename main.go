@@ -5,12 +5,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"time"
-	_ "net/http/pprof"
+
+	log "github.com/kawasin73/robustp/logger"
 )
 
 const (
@@ -211,7 +212,7 @@ func (s *Sender) recvThread(conn *net.UDPConn, chAck chan Header) {
 
 		header.Parse(buf)
 
-		log.Println("recv :", &header)
+		log.Debug("recv :", &header)
 
 		switch header.Type {
 		case TypeACK:
@@ -234,17 +235,17 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
 	for {
 		select {
 		case ack := <-chAck:
-			log.Println("recv ack : ", &ack)
+			log.Debug("recv ack : ", &ack)
 			f, ok := files[ack.Fileno]
 			if !ok {
-				log.Printf("error recv ack : fileno %d is not found\n", ack.Fileno)
+				log.Errorf("error recv ack : fileno %d is not found\n", ack.Fileno)
 				continue
 			}
 			if err := f.AckData(&ack); err != nil {
 				log.Panic(fmt.Errorf("recv ack : %v", err))
 			}
 			if f.IsAllCompleted() {
-				log.Printf("send finished fileno %d\n", f.fileno)
+				log.Infof("send finished fileno %d\n", f.fileno)
 			}
 
 		case now := <-timer.C:
@@ -254,7 +255,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
 				timers = timers[1:]
 
 				if !item.fctx.IsCompleted(item.seqno) {
-					log.Println("timeout : item.seqno :", item.seqno)
+					log.Debug("timeout : item.seqno :", item.seqno)
 					// resend
 					sendbuf := item.fctx.DataMsg(buf, item.seqno)
 					_, err := conn.Write(sendbuf)
@@ -299,7 +300,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
 func (s *Sender) sendFile(i uint32, data []byte) error {
 	f := newSendFileContext(i, data, s.segSize)
 	s.chSendFile <- f
-	log.Println("queue ", i)
+	log.Debug("queue ", i)
 	return nil
 }
 
@@ -337,7 +338,7 @@ func (r *Receiver) recvThread(conn *net.UDPConn) {
 
 		header.Parse(buf)
 
-		log.Println("recv :", &header)
+		log.Debug("recv :", &header)
 
 		switch header.Type {
 		case TypeDATA:
@@ -358,7 +359,7 @@ func (r *Receiver) recvThread(conn *net.UDPConn) {
 			if _, err := conn.Write(ackbuf); err != nil {
 				log.Panic(fmt.Errorf("send ack msg : %v", err))
 			}
-			log.Println("recv state :", f.state)
+			log.Debug("recv state :", f.state)
 
 		default:
 			log.Panic(fmt.Errorf("unexpected type"))
@@ -367,8 +368,9 @@ func (r *Receiver) recvThread(conn *net.UDPConn) {
 }
 
 func main() {
+	log.SetLevel(log.LvInfo)
 	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
+		log.Error(http.ListenAndServe("localhost:6060", nil))
 	}()
 	srcaddr, err := net.ResolveUDPAddr("udp4", "169.254.251.212:19809")
 	if err != nil {
@@ -390,14 +392,14 @@ func main() {
 		log.Panic(err)
 	}
 	defer recvConn.Close()
-	log.Println("hello world")
+	log.Info("hello world")
 
 	data, err := ioutil.ReadFile("tmp/sample")
 	if err != nil {
 		log.Panic(err)
 	}
 
-	log.Println("allocated")
+	log.Info("allocated")
 
 	// sender
 	sender := createSender(sendConn, 1500)
@@ -416,17 +418,17 @@ func main() {
 	for i := 0; i < filenum; i++ {
 		f := <-receiver.chRecvFile
 		if bytes.Equal(f.data[:], data[:]) {
-			log.Println("same data", f.fileno)
+			log.Info("same data", f.fileno)
 		} else {
-			log.Println("not same data")
-			log.Println(f.data[:10])
-			log.Println(data[:10])
-			log.Println(f.data[1024:1034])
-			log.Println(data[1024:1034])
-			log.Println(f.data[2048:2058])
-			log.Println(data[2048:2058])
-			log.Println(f.data[102400-481:])
-			log.Println(data[102400-481:])
+			log.Info("not same data")
+			log.Debug(f.data[:10])
+			log.Debug(data[:10])
+			log.Debug(f.data[1024:1034])
+			log.Debug(data[1024:1034])
+			log.Debug(f.data[2048:2058])
+			log.Debug(data[2048:2058])
+			log.Debug(f.data[102400-481:])
+			log.Debug(data[102400-481:])
 		}
 		if err := ioutil.WriteFile(fmt.Sprintf("tmp/file%d", f.fileno), f.data, os.ModePerm); err != nil {
 			log.Panic(err)
