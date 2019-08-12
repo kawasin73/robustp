@@ -3,13 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
-	"sync"
+	"net/http"
+	"os"
 	"time"
+	_ "net/http/pprof"
 )
 
 const (
@@ -177,46 +178,73 @@ type WaitItem struct {
 	seqno  uint32
 }
 
-func sendFile(i uint32, data []byte, conn *net.UDPConn, mtu int) error {
+type Sender struct {
+	segSize    uint16
+	chSendFile chan *FileContext
+}
+
+func createSender(conn *net.UDPConn, mtu int) *Sender {
 	mss := uint16(mtu - IPHeaderLen - UDPHeaderLen)
-
-	f := newSendFileContext(i, data, uint16(mss-RobustPHeaderLen))
-
-	var timers []*WaitItem
-
-	buf := make([]byte, mss)
-
-	for i := 0; i < len(data); i += int(f.segSize) {
-		sendbuf := f.DataMsg(buf, uint32(i))
-		_, err := conn.Write(sendbuf)
-		if err != nil {
-			return err
-		}
-		timers = append(timers, &WaitItem{
-			sentat: time.Now(),
-			fctx:   f,
-			seqno:  uint32(i),
-		})
+	segSize := uint16(mss - RobustPHeaderLen)
+	s := &Sender{
+		segSize:    segSize,
+		chSendFile: make(chan *FileContext),
 	}
-
 	chAck := make(chan Header)
+	go s.recvThread(conn, chAck)
+	go s.sendThread(conn, chAck)
+	return s
+}
 
-	go recvFile(conn, mtu, chAck)
+func (s *Sender) recvThread(conn *net.UDPConn, chAck chan Header) {
+	var header Header
+	buf := make([]byte, RobustPHeaderLen+s.segSize+1)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			log.Panic(err)
+		} else if n == len(buf) {
+			log.Panic(fmt.Sprintf("unexpected big size message"))
+		} else if n < RobustPHeaderLen {
+			log.Panic(fmt.Sprintf("unexpected small size message"))
+		}
 
+		header.Parse(buf)
+
+		log.Println("recv :", &header)
+
+		switch header.Type {
+		case TypeACK:
+			chAck <- header
+
+		default:
+			log.Panic(fmt.Errorf("unexpected type"))
+		}
+	}
+}
+
+func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
+	var timers []*WaitItem
+	buf := make([]byte, RobustPHeaderLen+s.segSize)
 	rto := time.Second
-
-	timer := time.NewTimer(timers[0].sentat.Add(rto).Sub(time.Now()))
+	files := make(map[uint32]*FileContext)
+	timer := time.NewTimer(0)
+	timer.Stop()
 
 	for {
 		select {
 		case ack := <-chAck:
 			log.Println("recv ack : ", &ack)
+			f, ok := files[ack.Fileno]
+			if !ok {
+				log.Printf("error recv ack : fileno %d is not found\n", ack.Fileno)
+				continue
+			}
 			if err := f.AckData(&ack); err != nil {
-				return fmt.Errorf("recv ack : %v", err)
+				log.Panic(fmt.Errorf("recv ack : %v", err))
 			}
 			if f.IsAllCompleted() {
-				log.Println("send finished")
-				return nil
+				log.Printf("send finished fileno %d\n", f.fileno)
 			}
 
 		case now := <-timer.C:
@@ -231,7 +259,7 @@ func sendFile(i uint32, data []byte, conn *net.UDPConn, mtu int) error {
 					sendbuf := item.fctx.DataMsg(buf, item.seqno)
 					_, err := conn.Write(sendbuf)
 					if err != nil {
-						return err
+						log.Panic(err)
 					}
 
 					// re-queue wait item
@@ -243,30 +271,68 @@ func sendFile(i uint32, data []byte, conn *net.UDPConn, mtu int) error {
 				// reset timer
 				timer.Reset(timers[0].sentat.Add(rto).Sub(time.Now()))
 			}
+
+		case f := <-s.chSendFile:
+			restartTimer := len(timers) == 0
+			files[f.fileno] = f
+			for i := 0; i < len(f.data); i += int(f.segSize) {
+				sendbuf := f.DataMsg(buf, uint32(i))
+				_, err := conn.Write(sendbuf)
+				if err != nil {
+					log.Panic(err)
+					return
+				}
+				timers = append(timers, &WaitItem{
+					sentat: time.Now(),
+					fctx:   f,
+					seqno:  uint32(i),
+				})
+			}
+			if restartTimer {
+				// reset timer
+				timer.Reset(timers[0].sentat.Add(rto).Sub(time.Now()))
+			}
 		}
 	}
+}
 
+func (s *Sender) sendFile(i uint32, data []byte) error {
+	f := newSendFileContext(i, data, s.segSize)
+	s.chSendFile <- f
+	log.Println("queue ", i)
 	return nil
 }
 
-func recvFile(conn *net.UDPConn, mtu int, chAck chan<- Header) ([]byte, error) {
-	var header Header
+type Receiver struct {
+	segSize    uint16
+	chRecvFile chan *FileContext
+}
+
+func createReceiver(conn *net.UDPConn, mtu int) *Receiver {
 	mss := uint16(mtu - IPHeaderLen - UDPHeaderLen)
 	segSize := uint16(mss - RobustPHeaderLen)
-	buf := make([]byte, mss+1)
+	r := &Receiver{
+		segSize:    segSize,
+		chRecvFile: make(chan *FileContext),
+	}
+	go r.recvThread(conn)
+	return r
+}
 
-	var lost bool
+func (r *Receiver) recvThread(conn *net.UDPConn) {
+	var header Header
+	buf := make([]byte, RobustPHeaderLen+r.segSize+1)
 
-	var f *FileContext
+	files := make(map[uint32]*FileContext)
 
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			return nil, err
+			log.Panic(err)
 		} else if n == len(buf) {
-			return nil, errors.New("unexpected big size message")
+			log.Panic(fmt.Sprintf("unexpected big size message"))
 		} else if n < RobustPHeaderLen {
-			return nil, errors.New("unexpected small size message")
+			log.Panic(fmt.Sprintf("unexpected small size message"))
 		}
 
 		header.Parse(buf)
@@ -275,38 +341,35 @@ func recvFile(conn *net.UDPConn, mtu int, chAck chan<- Header) ([]byte, error) {
 
 		switch header.Type {
 		case TypeDATA:
-			if f == nil {
-				f = newRecvFileContext(&header, segSize)
+			f, ok := files[header.Fileno]
+			if !ok {
+				f = newRecvFileContext(&header, r.segSize)
+				files[header.Fileno] = f
 			}
-			if err := f.SaveData(&header, buf); err != nil {
-				return nil, err
-			}
-			// send ACK
-			//chAck <- header
-
-			if !lost && header.Seqno+uint32(header.Length) > header.TotalLength {
-				lost = true
-			} else {
-				ackbuf := f.AckMsg(buf)
-				if _, err := conn.Write(ackbuf); err != nil {
-					return nil, fmt.Errorf("send ack msg : %v", err)
+			if !f.IsAllCompleted() {
+				if err := f.SaveData(&header, buf); err != nil {
+					log.Panic(err)
 				}
 				if f.IsAllCompleted() {
-					log.Println("recv finished")
-					return f.data, nil
+					r.chRecvFile <- f
 				}
 			}
-
-		case TypeACK:
-			chAck <- header
+			ackbuf := f.AckMsg(buf)
+			if _, err := conn.Write(ackbuf); err != nil {
+				log.Panic(fmt.Errorf("send ack msg : %v", err))
+			}
+			log.Println("recv state :", f.state)
 
 		default:
-			return nil, errors.New("unexpected type")
+			log.Panic(fmt.Errorf("unexpected type"))
 		}
 	}
 }
 
 func main() {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 	srcaddr, err := net.ResolveUDPAddr("udp4", "169.254.251.212:19809")
 	if err != nil {
 		log.Panic(err)
@@ -334,47 +397,39 @@ func main() {
 		log.Panic(err)
 	}
 
-	var wg sync.WaitGroup
-
 	log.Println("allocated")
 
-	wg.Add(2)
-
 	// sender
+	sender := createSender(sendConn, 1500)
+
+	receiver := createReceiver(recvConn, 1500)
+
+	const (
+		filenum = 100
+	)
 	go func() {
-		defer wg.Done()
-		if err := sendFile(0, data, sendConn, 1500); err != nil {
-			log.Panic(err)
+		for i := 0; i < filenum; i++ {
+			sender.sendFile(uint32(i), data)
 		}
 	}()
 
-	// recver
-	go func() {
-		defer wg.Done()
-		chAck := make(chan Header)
-		//go func() {
-		//	for {
-		//		ack := <-chAck
-		//
-		//	}
-		//}()
-		d, err := recvFile(recvConn, 1500, chAck)
-		if err != nil {
-			log.Println(err)
-		} else if bytes.Equal(d[:], data[:]) {
-			log.Println("same data")
+	for i := 0; i < filenum; i++ {
+		f := <-receiver.chRecvFile
+		if bytes.Equal(f.data[:], data[:]) {
+			log.Println("same data", f.fileno)
 		} else {
 			log.Println("not same data")
-			log.Println(d[:10])
+			log.Println(f.data[:10])
 			log.Println(data[:10])
-			log.Println(d[1024:1034])
+			log.Println(f.data[1024:1034])
 			log.Println(data[1024:1034])
-			log.Println(d[2048:2058])
+			log.Println(f.data[2048:2058])
 			log.Println(data[2048:2058])
-			log.Println(d[102400-481:])
+			log.Println(f.data[102400-481:])
 			log.Println(data[102400-481:])
 		}
-	}()
-
-	wg.Wait()
+		if err := ioutil.WriteFile(fmt.Sprintf("tmp/file%d", f.fileno), f.data, os.ModePerm); err != nil {
+			log.Panic(err)
+		}
+	}
 }
