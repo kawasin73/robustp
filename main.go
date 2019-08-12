@@ -357,7 +357,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 			log.Debug("recv ack : ", ack)
 			f, ok := files[ack.header.Fileno]
 			if !ok {
-				log.Errorf("error recv ack : fileno %d is not found\n", ack.header.Fileno)
+				log.Infof("recv ack : fileno %d is not found\n", ack.header.Fileno)
 				continue
 			}
 			if nack, err := f.AckData(&ack); err != nil {
@@ -367,6 +367,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 			}
 			if f.IsAllCompleted() {
 				log.Infof("send finished fileno %d\n", f.fileno)
+				delete(files, f.fileno)
 			}
 			queueFirst()
 
@@ -460,6 +461,8 @@ func (r *Receiver) recvThread(conn *net.UDPConn) {
 				}
 				if f.IsAllCompleted() {
 					r.chRecvFile <- f
+					// TODO: remove file context
+					// それ以降に Data が送られて来ないように ACK + FIN によるコネクションを閉じる考え方が必要。
 				}
 			}
 			ackbuf := f.AckMsg(buf)
