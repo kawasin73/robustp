@@ -137,15 +137,10 @@ func (f *FileContext) SaveData(header *Header, buf []byte) error {
 		f.state[stateno] = true
 
 		// update completed stateno
-		ok := true
-		for _, b := range f.state[f.completed:stateno] {
-			if !b {
-				ok = false
-			}
+		completed := f.completed
+		for ; completed < len(f.state) && f.state[completed]; completed++ {
 		}
-		if ok {
-			f.completed = stateno + 1
-		}
+		f.completed = completed
 	} else {
 		// already ack
 	}
