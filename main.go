@@ -66,13 +66,53 @@ func (h *Header) Encode(buf []byte) {
 	binary.BigEndian.PutUint32(buf[12:], h.TotalLength)
 }
 
+type PartialAck struct {
+	seqno  uint32
+	length uint32
+}
+
+type AckMsg struct {
+	header   Header
+	partials []PartialAck
+}
+
+func (ack *AckMsg) String() string {
+	return fmt.Sprintf("{%v, %v}", &ack.header, ack.partials)
+}
+
+func ParsePartialAck(buf []byte, header *Header) []PartialAck {
+	buf = buf[header.HeaderLength:header.Length]
+	n := len(buf) / 8
+	acks := make([]PartialAck, n)
+	for i := 0; i < n; i++ {
+		seqno := binary.BigEndian.Uint32(buf)
+		length := binary.BigEndian.Uint32(buf[4:])
+		acks[i] = PartialAck{seqno: seqno, length: length}
+	}
+	return acks
+}
+
+func EncodePartialAck(buf []byte, header *Header, acks []PartialAck) {
+	buf = buf[header.HeaderLength:]
+	for _, ack := range acks {
+		if len(buf) < 8 {
+			break
+		}
+		binary.BigEndian.PutUint32(buf, ack.seqno)
+		binary.BigEndian.PutUint32(buf[4:], ack.length)
+		header.Length += 8
+		buf = buf[8:]
+	}
+}
+
 type FileContext struct {
 	fileno  uint32
 	data    []byte
 	state   []bool
 	segSize uint16
 
-	completed int
+	tail       int
+	ncompleted int
 }
 
 func newSendFileContext(fileno uint32, data []byte, segSize uint16) *FileContext {
@@ -119,9 +159,28 @@ func (f *FileContext) AckMsg(buf []byte) []byte {
 		HeaderLength: RobustPHeaderLen,
 		Length:       RobustPHeaderLen,
 		Fileno:       f.fileno,
-		Seqno:        uint32(f.completed * int(f.segSize)),
+		Seqno:        uint32(f.tail * int(f.segSize)),
 		TotalLength:  uint32(len(f.data)),
 	}
+
+	i := f.tail
+	var (
+		partials []PartialAck
+		nseg int
+	)
+	for f.ncompleted-f.tail-nseg > 0 {
+		// search for first completed segment from tail
+		for ; !f.state[i]; i++ {
+		}
+		seqno := uint32(i) * uint32(f.segSize)
+		length := uint32(0)
+		for ; i < len(f.state) && f.state[i]; i++ {
+			length += uint32(f.segSize)
+			nseg++
+		}
+		partials = append(partials, PartialAck{seqno: seqno, length: length})
+	}
+	EncodePartialAck(buf, &header, partials)
 	header.Encode(buf)
 	return buf[:header.Length]
 }
@@ -133,39 +192,53 @@ func (f *FileContext) SaveData(header *Header, buf []byte) error {
 	stateno := int(header.Seqno) / int(f.segSize)
 
 	if !f.state[stateno] {
-		if buf != nil {
-			copy(f.data[header.Seqno:header.Seqno+uint32(header.Length-uint16(header.HeaderLength))], buf[header.HeaderLength:])
-		}
+		copy(f.data[header.Seqno:header.Seqno+uint32(header.Length-uint16(header.HeaderLength))], buf[header.HeaderLength:])
 		f.state[stateno] = true
+		f.ncompleted++
 
-		// update completed stateno
-		completed := f.completed
+		// update tail stateno
+		completed := f.tail
 		for ; completed < len(f.state) && f.state[completed]; completed++ {
 		}
-		f.completed = completed
+		f.tail = completed
 	} else {
 		// already ack
 	}
 	return nil
 }
 
-func (f *FileContext) AckData(header *Header) (int, error) {
-	if f.fileno != header.Fileno {
+func (f *FileContext) AckData(ack *AckMsg) (int, error) {
+	if f.fileno != ack.header.Fileno {
 		return 0, fmt.Errorf("invalid fileno for save data")
 	}
+	stateno := int(ack.header.Seqno) / int(f.segSize)
 	var n int
-	stateno := int(header.Seqno) / int(f.segSize)
 
-	// update completed stateno
-	if f.completed < stateno {
-		for i := f.completed; i < stateno; i++ {
+	// update tail stateno
+	if f.tail < stateno {
+		for i := f.tail; i < stateno; i++ {
 			if !f.state[i] {
 				f.state[i] = true
 				n++
+				f.ncompleted++
 			}
 		}
-		f.completed = stateno
+		f.tail = stateno
 	}
+
+	// update partial ack
+	for _, partial := range ack.partials {
+		head := partial.seqno / uint32(f.segSize)
+		l := partial.length / uint32(f.segSize)
+		for i := uint32(0); i < l; i++ {
+			if !f.state[head+i] {
+				f.state[head+i] = true
+				n++
+				f.ncompleted++
+			}
+		}
+	}
+
 	return n, nil
 }
 
@@ -174,7 +247,7 @@ func (f *FileContext) IsCompleted(seqno uint32) bool {
 }
 
 func (f *FileContext) IsAllCompleted() bool {
-	return f.completed == len(f.state)
+	return f.tail == len(f.state)
 }
 
 type WaitItem struct {
@@ -195,13 +268,13 @@ func createSender(conn *net.UDPConn, mtu int) *Sender {
 		segSize:    segSize,
 		chSendFile: make(chan *FileContext),
 	}
-	chAck := make(chan Header)
+	chAck := make(chan AckMsg)
 	go s.recvThread(conn, chAck)
 	go s.sendThread(conn, chAck)
 	return s
 }
 
-func (s *Sender) recvThread(conn *net.UDPConn, chAck chan Header) {
+func (s *Sender) recvThread(conn *net.UDPConn, chAck chan AckMsg) {
 	var header Header
 	buf := make([]byte, RobustPHeaderLen+s.segSize+1)
 	for {
@@ -220,7 +293,8 @@ func (s *Sender) recvThread(conn *net.UDPConn, chAck chan Header) {
 
 		switch header.Type {
 		case TypeACK:
-			chAck <- header
+			partials := ParsePartialAck(buf, &header)
+			chAck <- AckMsg{header: header, partials: partials}
 
 		default:
 			log.Panic(fmt.Errorf("unexpected type"))
@@ -228,7 +302,7 @@ func (s *Sender) recvThread(conn *net.UDPConn, chAck chan Header) {
 	}
 }
 
-func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
+func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 	var timers []*WaitItem
 	buf := make([]byte, RobustPHeaderLen+s.segSize)
 
@@ -242,7 +316,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
 		chQueueFile <-chan *FileContext = s.chSendFile
 		queueFile   *FileContext
 		queueSeqno  int
-		window      = 100
+		window      = 1000
 		nsent       int
 	)
 
@@ -280,10 +354,10 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
 	for {
 		select {
 		case ack := <-chAck:
-			log.Debug("recv ack : ", &ack)
-			f, ok := files[ack.Fileno]
+			log.Debug("recv ack : ", ack)
+			f, ok := files[ack.header.Fileno]
 			if !ok {
-				log.Errorf("error recv ack : fileno %d is not found\n", ack.Fileno)
+				log.Errorf("error recv ack : fileno %d is not found\n", ack.header.Fileno)
 				continue
 			}
 			if nack, err := f.AckData(&ack); err != nil {
