@@ -149,20 +149,24 @@ func (f *FileContext) SaveData(header *Header, buf []byte) error {
 	return nil
 }
 
-func (f *FileContext) AckData(header *Header) error {
+func (f *FileContext) AckData(header *Header) (int, error) {
 	if f.fileno != header.Fileno {
-		return fmt.Errorf("invalid fileno for save data")
+		return 0, fmt.Errorf("invalid fileno for save data")
 	}
+	var n int
 	stateno := int(header.Seqno) / int(f.segSize)
 
 	// update completed stateno
 	if f.completed < stateno {
 		for i := f.completed; i < stateno; i++ {
-			f.state[i] = true
+			if !f.state[i] {
+				f.state[i] = true
+				n++
+			}
 		}
 		f.completed = stateno
 	}
-	return nil
+	return n, nil
 }
 
 func (f *FileContext) IsCompleted(seqno uint32) bool {
@@ -227,10 +231,51 @@ func (s *Sender) recvThread(conn *net.UDPConn, chAck chan Header) {
 func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
 	var timers []*WaitItem
 	buf := make([]byte, RobustPHeaderLen+s.segSize)
+
 	rto := time.Second
+
 	files := make(map[uint32]*FileContext)
 	timer := time.NewTimer(0)
 	timer.Stop()
+
+	var (
+		chQueueFile <-chan *FileContext = s.chSendFile
+		queueFile   *FileContext
+		queueSeqno  int
+		window      = 100
+		nsent       int
+	)
+
+	queueFirst := func() {
+		if queueFile == nil {
+			return
+		}
+		restartTimer := len(timers) == 0
+		for ; queueSeqno < len(queueFile.data) && nsent < window; queueSeqno += int(queueFile.segSize) {
+			sendbuf := queueFile.DataMsg(buf, uint32(queueSeqno))
+			_, err := conn.Write(sendbuf)
+			if err != nil {
+				log.Panic(err)
+				return
+			}
+			timers = append(timers, &WaitItem{
+				sentat: time.Now(),
+				fctx:   queueFile,
+				seqno:  uint32(queueSeqno),
+			})
+			nsent++
+		}
+		if queueSeqno >= len(queueFile.data) {
+			// finish to queue all msg in file
+			chQueueFile = s.chSendFile
+			queueFile = nil
+			queueSeqno = 0
+		}
+		if restartTimer && len(timers) > 0 {
+			// reset timer
+			timer.Reset(timers[0].sentat.Add(rto).Sub(time.Now()))
+		}
+	}
 
 	for {
 		select {
@@ -241,12 +286,15 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
 				log.Errorf("error recv ack : fileno %d is not found\n", ack.Fileno)
 				continue
 			}
-			if err := f.AckData(&ack); err != nil {
+			if nack, err := f.AckData(&ack); err != nil {
 				log.Panic(fmt.Errorf("recv ack : %v", err))
+			} else {
+				nsent -= nack
 			}
 			if f.IsAllCompleted() {
 				log.Infof("send finished fileno %d\n", f.fileno)
 			}
+			queueFirst()
 
 		case now := <-timer.C:
 			for len(timers) > 0 && timers[0].sentat.Before(now) {
@@ -255,7 +303,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
 				timers = timers[1:]
 
 				if !item.fctx.IsCompleted(item.seqno) {
-					log.Debug("timeout : item.seqno :", item.seqno)
+					log.Infof("timeout : fileno: %d, seqno: %d", item.fctx.fileno, item.seqno)
 					// resend
 					sendbuf := item.fctx.DataMsg(buf, item.seqno)
 					_, err := conn.Write(sendbuf)
@@ -273,26 +321,11 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan Header) {
 				timer.Reset(timers[0].sentat.Add(rto).Sub(time.Now()))
 			}
 
-		case f := <-s.chSendFile:
-			restartTimer := len(timers) == 0
+		case f := <-chQueueFile:
 			files[f.fileno] = f
-			for i := 0; i < len(f.data); i += int(f.segSize) {
-				sendbuf := f.DataMsg(buf, uint32(i))
-				_, err := conn.Write(sendbuf)
-				if err != nil {
-					log.Panic(err)
-					return
-				}
-				timers = append(timers, &WaitItem{
-					sentat: time.Now(),
-					fctx:   f,
-					seqno:  uint32(i),
-				})
-			}
-			if restartTimer {
-				// reset timer
-				timer.Reset(timers[0].sentat.Add(rto).Sub(time.Now()))
-			}
+			chQueueFile = nil
+			queueFile = f
+			queueFirst()
 		}
 	}
 }
