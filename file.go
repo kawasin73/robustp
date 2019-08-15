@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	log "github.com/kawasin73/robustp/logger"
 )
 
 type FileContext struct {
@@ -111,7 +110,7 @@ func (f *FileContext) SaveData(header *Header, buf []byte) error {
 
 func (f *FileContext) AckData(ack *AckMsg) {
 	if f.fileno != ack.header.Fileno {
-		log.Panic(fmt.Errorf("invalid fileno for save data"))
+		panic(fmt.Errorf("invalid fileno for save data"))
 	}
 	stateno := int(ack.header.Offset) / int(f.segSize)
 

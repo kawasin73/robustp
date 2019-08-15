@@ -63,10 +63,11 @@ func readThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, segS
 }
 
 type Sender struct {
-	segSize    uint16
-	chSendFile chan *FileSegment
-	chAck      chan AckMsg
-	rtt        *RTTCollecter
+	segSize     uint16
+	chSendFile  chan *FileSegment
+	chAck       chan AckMsg
+	rtt         *RTTCollecter
+	established bool
 }
 
 func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mtu int, rtt *RTTCollecter) *Sender {
@@ -93,7 +94,18 @@ func (s *Sender) HandleRead(ctx context.Context, buf []byte, header *Header) err
 			return ctx.Err()
 		case s.chAck <- AckMsg{header: *header, partials: partials}:
 		}
+		return nil
 
+	case TypeACK_CONN:
+		if s.established {
+			return nil
+		}
+		s.established = true
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case s.chAck <- AckMsg{header: *header, partials: nil}:
+		}
 		return nil
 
 	default:
@@ -106,8 +118,7 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 	var window []TransSegment
 	buf := make([]byte, RobustPHeaderLen+s.segSize)
 
-	timer := time.NewTimer(0)
-	timer.Stop()
+	timer := time.NewTimer(10 * time.Millisecond)
 
 	var (
 		chQueueSegment <-chan *FileSegment = s.chSendFile
@@ -144,10 +155,43 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 		return nsent < windowSize
 	}
 
+	// wait for connection established
+establish:
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("shutdown sender thread")
+			timer.Stop()
+			return
+
+		case <-s.chAck:
+			// accept ACK_CONN
+			timer.Stop()
+			break establish
+
+		case <-timer.C:
+			// send CONN msg
+			header := Header{
+				Type:         TypeCONN,
+				HeaderLength: RobustPHeaderLen,
+				Length:       RobustPHeaderLen,
+			}
+			connbuf := EncodeHeaderMsg(buf, &header)
+			if _, err := conn.Write(connbuf); err != nil {
+				log.Panic(err)
+			}
+
+			// wait for ACK_CONN
+			timer.Reset(10 * time.Millisecond)
+		}
+	}
+
+	// start send files
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("shutdown sender thread")
+			timer.Stop()
 			return
 
 		case ack := <-s.chAck:
@@ -237,9 +281,10 @@ func (s *Sender) sendFile(i uint32, data []byte) error {
 }
 
 type Receiver struct {
-	segSize    uint16
-	chRecvFile chan *FileContext
-	files      map[uint32]*FileContext
+	segSize     uint16
+	chRecvFile  chan *FileContext
+	files       map[uint32]*FileContext
+	established time.Time
 	// TODO: have conn?
 	conn *net.UDPConn
 }
@@ -281,6 +326,21 @@ func (r *Receiver) HandleRead(ctx context.Context, buf []byte, header *Header) e
 			log.Panic(fmt.Errorf("send ack msg : %v", err))
 		}
 		log.Debug("recv state :", f.state)
+		return nil
+
+	case TypeCONN:
+		now := time.Now()
+		if now.Sub(r.established) < 20*time.Millisecond {
+			// already established
+			return nil
+		}
+		// response ACK_CONN
+		header.Type = TypeACK_CONN
+		ackbuf := EncodeHeaderMsg(buf, header)
+		if _, err := r.conn.Write(ackbuf); err != nil {
+			log.Panic(fmt.Errorf("send ack conn msg : %v", err))
+		}
+		r.established = now
 		return nil
 
 	default:
@@ -332,7 +392,7 @@ func main() {
 	receiver := createReceiver(ctx, &wg, recvConn, 1500)
 
 	const (
-		filenum = 100
+		filenum = 1
 	)
 	go func() {
 		for i := 0; i < filenum; i++ {

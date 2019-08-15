@@ -8,6 +8,8 @@ import (
 const (
 	TypeDATA = iota + 1
 	TypeACK
+	TypeCONN
+	TypeACK_CONN
 )
 
 const (
@@ -33,6 +35,10 @@ func (h *Header) String() string {
 		t = "DATA"
 	case TypeACK:
 		t = "ACK"
+	case TypeCONN:
+		t = "CONN"
+	case TypeACK_CONN:
+		t = "ACK_CONN"
 	default:
 		t = fmt.Sprintf("UNK(%d)", h.Type)
 	}
@@ -97,4 +103,9 @@ func EncodePartialAck(buf []byte, header *Header, acks []PartialAck) {
 		header.Length += 8
 		buf = buf[8:]
 	}
+}
+
+func EncodeHeaderMsg(buf []byte, header *Header) []byte {
+	header.Encode(buf)
+	return buf[:RobustPHeaderLen]
 }
