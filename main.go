@@ -22,7 +22,7 @@ type TransSegment struct {
 }
 
 type ReadHandler interface {
-	HandleRead(buf []byte, header *Header) error
+	HandleRead(ctx context.Context, buf []byte, header *Header) error
 }
 
 func readThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, segSize uint16, handler ReadHandler) {
@@ -31,9 +31,19 @@ func readThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, segS
 	var header Header
 	buf := make([]byte, RobustPHeaderLen+segSize+1)
 	for {
+		if err := conn.SetReadDeadline(time.Now().Add(time.Millisecond * 10)); err != nil {
+			log.Panic(err)
+		}
 		n, err := conn.Read(buf)
-		// TODO: set timeout and check ctx
 		if err != nil {
+			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					continue
+				}
+			}
 			log.Panic(err)
 		} else if n == len(buf) {
 			log.Panic(fmt.Sprintf("unexpected big size message"))
@@ -45,7 +55,7 @@ func readThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, segS
 
 		log.Debug("recv :", &header)
 
-		if err = handler.HandleRead(buf, &header); err != nil {
+		if err = handler.HandleRead(ctx, buf, &header); err != nil {
 			log.Error("failed to handle read :", err)
 		}
 	}
@@ -67,18 +77,22 @@ func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mt
 		chAck:      make(chan AckMsg),
 		rtt:        rtt,
 	}
-	// TODO: sendThread wg
-	wg.Add(1)
+	wg.Add(2)
 	go readThread(ctx, wg, conn, segSize, s)
-	go s.sendThread(conn, s.chAck)
+	go s.sendThread(ctx, wg, conn)
 	return s
 }
 
-func (s *Sender) HandleRead(buf []byte, header *Header) error {
+func (s *Sender) HandleRead(ctx context.Context, buf []byte, header *Header) error {
 	switch header.Type {
 	case TypeACK:
 		partials := ParsePartialAck(buf, header)
-		s.chAck <- AckMsg{header: *header, partials: partials}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case s.chAck <- AckMsg{header: *header, partials: partials}:
+		}
+
 		return nil
 
 	default:
@@ -86,7 +100,8 @@ func (s *Sender) HandleRead(buf []byte, header *Header) error {
 	}
 }
 
-func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
+func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn) {
+	defer wg.Done()
 	var window []TransSegment
 	buf := make([]byte, RobustPHeaderLen+s.segSize)
 
@@ -130,7 +145,11 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 
 	for {
 		select {
-		case ack := <-chAck:
+		case <-ctx.Done():
+			log.Info("shutdown sender thread...")
+			return
+
+		case ack := <-s.chAck:
 			log.Debug("recv ack : ", &ack)
 			log.Debug("transHead :", transHead)
 			log.Debug("window size:", len(window))
@@ -238,7 +257,7 @@ func createReceiver(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, 
 	return r
 }
 
-func (r *Receiver) HandleRead(buf []byte, header *Header) error {
+func (r *Receiver) HandleRead(ctx context.Context, buf []byte, header *Header) error {
 	switch header.Type {
 	case TypeDATA:
 		f, ok := r.files[header.Fileno]
@@ -340,6 +359,10 @@ func main() {
 		}
 	}
 
+	time.Sleep(100 * time.Millisecond)
+
+	log.Info("shutdown...")
+
 	cancel()
-	//wg.Wait()
+	wg.Wait()
 }
