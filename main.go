@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"sync"
 	"time"
 
 	log "github.com/kawasin73/robustp/logger"
@@ -19,31 +21,18 @@ type TransSegment struct {
 	ack     bool
 }
 
-type Sender struct {
-	segSize    uint16
-	chSendFile chan *FileSegment
-	rtt        *RTTCollecter
+type ReadHandler interface {
+	HandleRead(buf []byte, header *Header) error
 }
 
-func createSender(conn *net.UDPConn, mtu int, rtt *RTTCollecter) *Sender {
-	mss := uint16(mtu - IPHeaderLen - UDPHeaderLen)
-	segSize := uint16(mss - RobustPHeaderLen)
-	s := &Sender{
-		segSize:    segSize,
-		chSendFile: make(chan *FileSegment),
-		rtt:        rtt,
-	}
-	chAck := make(chan AckMsg)
-	go s.recvThread(conn, chAck)
-	go s.sendThread(conn, chAck)
-	return s
-}
+func readThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, segSize uint16, handler ReadHandler) {
+	defer wg.Done()
 
-func (s *Sender) recvThread(conn *net.UDPConn, chAck chan AckMsg) {
 	var header Header
-	buf := make([]byte, RobustPHeaderLen+s.segSize+1)
+	buf := make([]byte, RobustPHeaderLen+segSize+1)
 	for {
 		n, err := conn.Read(buf)
+		// TODO: set timeout and check ctx
 		if err != nil {
 			log.Panic(err)
 		} else if n == len(buf) {
@@ -56,14 +45,44 @@ func (s *Sender) recvThread(conn *net.UDPConn, chAck chan AckMsg) {
 
 		log.Debug("recv :", &header)
 
-		switch header.Type {
-		case TypeACK:
-			partials := ParsePartialAck(buf, &header)
-			chAck <- AckMsg{header: header, partials: partials}
-
-		default:
-			log.Panic(fmt.Errorf("unexpected type"))
+		if err = handler.HandleRead(buf, &header); err != nil {
+			log.Error("failed to handle read :", err)
 		}
+	}
+}
+
+type Sender struct {
+	segSize    uint16
+	chSendFile chan *FileSegment
+	chAck      chan AckMsg
+	rtt        *RTTCollecter
+}
+
+func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mtu int, rtt *RTTCollecter) *Sender {
+	mss := uint16(mtu - IPHeaderLen - UDPHeaderLen)
+	segSize := uint16(mss - RobustPHeaderLen)
+	s := &Sender{
+		segSize:    segSize,
+		chSendFile: make(chan *FileSegment),
+		chAck:      make(chan AckMsg),
+		rtt:        rtt,
+	}
+	// TODO: sendThread wg
+	wg.Add(1)
+	go readThread(ctx, wg, conn, segSize, s)
+	go s.sendThread(conn, s.chAck)
+	return s
+}
+
+func (s *Sender) HandleRead(buf []byte, header *Header) error {
+	switch header.Type {
+	case TypeACK:
+		partials := ParsePartialAck(buf, header)
+		s.chAck <- AckMsg{header: *header, partials: partials}
+		return nil
+
+	default:
+		return fmt.Errorf("unexpected type for sender : %v", header)
 	}
 }
 
@@ -112,7 +131,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 	for {
 		select {
 		case ack := <-chAck:
-			log.Debug("recv ack : ", ack)
+			log.Debug("recv ack : ", &ack)
 			log.Debug("transHead :", transHead)
 			log.Debug("window size:", len(window))
 			log.Debug("nsent :", nsent)
@@ -200,65 +219,52 @@ func (s *Sender) sendFile(i uint32, data []byte) error {
 type Receiver struct {
 	segSize    uint16
 	chRecvFile chan *FileContext
+	files      map[uint32]*FileContext
+	// TODO: have conn?
+	conn *net.UDPConn
 }
 
-func createReceiver(conn *net.UDPConn, mtu int) *Receiver {
+func createReceiver(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mtu int) *Receiver {
 	mss := uint16(mtu - IPHeaderLen - UDPHeaderLen)
 	segSize := uint16(mss - RobustPHeaderLen)
 	r := &Receiver{
 		segSize:    segSize,
 		chRecvFile: make(chan *FileContext),
+		files:      make(map[uint32]*FileContext),
+		conn:       conn,
 	}
-	go r.recvThread(conn)
+	wg.Add(1)
+	go readThread(ctx, wg, conn, segSize, r)
 	return r
 }
 
-func (r *Receiver) recvThread(conn *net.UDPConn) {
-	var header Header
-	buf := make([]byte, RobustPHeaderLen+r.segSize+1)
-
-	files := make(map[uint32]*FileContext)
-
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			log.Panic(err)
-		} else if n == len(buf) {
-			log.Panic(fmt.Sprintf("unexpected big size message"))
-		} else if n < RobustPHeaderLen {
-			log.Panic(fmt.Sprintf("unexpected small size message"))
+func (r *Receiver) HandleRead(buf []byte, header *Header) error {
+	switch header.Type {
+	case TypeDATA:
+		f, ok := r.files[header.Fileno]
+		if !ok {
+			f = newRecvFileContext(header, r.segSize)
+			r.files[header.Fileno] = f
 		}
-
-		header.Parse(buf)
-
-		log.Debug("recv :", &header)
-
-		switch header.Type {
-		case TypeDATA:
-			f, ok := files[header.Fileno]
-			if !ok {
-				f = newRecvFileContext(&header, r.segSize)
-				files[header.Fileno] = f
+		if !f.IsAllCompleted() {
+			if err := f.SaveData(header, buf); err != nil {
+				log.Panic(err)
 			}
-			if !f.IsAllCompleted() {
-				if err := f.SaveData(&header, buf); err != nil {
-					log.Panic(err)
-				}
-				if f.IsAllCompleted() {
-					r.chRecvFile <- f
-					// TODO: remove file context
-					// それ以降に Data が送られて来ないように ACK + FIN によるコネクションを閉じる考え方が必要。
-				}
+			if f.IsAllCompleted() {
+				r.chRecvFile <- f
+				// TODO: remove file context
+				// それ以降に Data が送られて来ないように ACK + FIN によるコネクションを閉じる考え方が必要。
 			}
-			ackbuf := f.AckMsg(buf, header.TransId)
-			if _, err := conn.Write(ackbuf); err != nil {
-				log.Panic(fmt.Errorf("send ack msg : %v", err))
-			}
-			log.Debug("recv state :", f.state)
-
-		default:
-			log.Panic(fmt.Errorf("unexpected type"))
 		}
+		ackbuf := f.AckMsg(buf, header.TransId)
+		if _, err := r.conn.Write(ackbuf); err != nil {
+			log.Panic(fmt.Errorf("send ack msg : %v", err))
+		}
+		log.Debug("recv state :", f.state)
+		return nil
+
+	default:
+		return fmt.Errorf("unexpected type for receiver : %v", header)
 	}
 }
 
@@ -287,21 +293,23 @@ func main() {
 		log.Panic(err)
 	}
 	defer recvConn.Close()
-	log.Info("hello world")
 
 	data, err := ioutil.ReadFile("tmp/sample")
 	if err != nil {
 		log.Panic(err)
 	}
 
-	log.Info("allocated")
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	rtt := newRTTCollecter(30, &DoubleRTO{})
 
 	// sender
-	sender := createSender(sendConn, 1500, rtt)
+	sender := createSender(ctx, &wg, sendConn, 1500, rtt)
 
-	receiver := createReceiver(recvConn, 1500)
+	receiver := createReceiver(ctx, &wg, recvConn, 1500)
 
 	const (
 		filenum = 100
@@ -331,4 +339,7 @@ func main() {
 			log.Panic(err)
 		}
 	}
+
+	cancel()
+	//wg.Wait()
 }
