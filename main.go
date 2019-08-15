@@ -16,7 +16,7 @@ import (
 )
 
 type TransSegment struct {
-	sentat  time.Time
+	sendat  time.Time
 	segment *FileSegment
 	ack     bool
 }
@@ -70,7 +70,7 @@ type Sender struct {
 	established bool
 }
 
-func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mtu int, rtt *RTTCollecter) *Sender {
+func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mtu int, rtt *RTTCollecter, ctrl CongestionControlAlgorithm) *Sender {
 	mss := uint16(mtu - IPHeaderLen - UDPHeaderLen)
 	segSize := uint16(mss - RobustPHeaderLen)
 	s := &Sender{
@@ -81,7 +81,7 @@ func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mt
 	}
 	wg.Add(2)
 	go readThread(ctx, wg, conn, segSize, s)
-	go s.sendThread(ctx, wg, conn)
+	go s.sendThread(ctx, wg, conn, ctrl)
 	return s
 }
 
@@ -113,7 +113,7 @@ func (s *Sender) HandleRead(ctx context.Context, buf []byte, header *Header) err
 	}
 }
 
-func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn) {
+func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, ctrl CongestionControlAlgorithm) {
 	defer wg.Done()
 	var window []TransSegment
 	buf := make([]byte, RobustPHeaderLen+s.segSize)
@@ -123,7 +123,6 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 	var (
 		chQueueSegment <-chan *FileSegment = s.chSendFile
 		transHead      uint32
-		windowSize     = 260
 		nsent          int
 		isTimer        bool
 	)
@@ -131,7 +130,7 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 	setTimer := func() {
 		if !isTimer && len(window) > 0 {
 			// window[0] must be ack == false
-			timer.Reset(window[0].sentat.Add(s.rtt.RTO).Sub(time.Now()))
+			timer.Reset(window[0].sendat.Add(s.rtt.RTO).Sub(time.Now()))
 			isTimer = true
 		}
 	}
@@ -147,12 +146,12 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 		}
 
 		// add window
-		window = append(window, TransSegment{sentat: now, segment: segment})
+		window = append(window, TransSegment{sendat: now, segment: segment})
 		nsent++
 
 		// set timer
 		setTimer()
-		return nsent < windowSize
+		return nsent < ctrl.WindowSize()
 	}
 
 	// wait for connection established
@@ -188,6 +187,7 @@ establish:
 
 	// start send files
 	for {
+		log.Debug("congestion size:", ctrl.WindowSize())
 		select {
 		case <-ctx.Done():
 			log.Info("shutdown sender thread")
@@ -207,7 +207,10 @@ establish:
 
 			for transHead < ack.header.TransId {
 				// TODO: resend
+				//ctrl.Add(CONG_LOSS|CONG_EARLY, item.sendat, 0)
 			}
+
+			// TODO: backup overflow segments
 
 			// if transId is valid
 			idxWindow := int(ack.header.TransId) - int(transHead)
@@ -219,9 +222,12 @@ establish:
 				item := window[idxWindow]
 				item.segment.Ack(&ack)
 
+				rtt := acktime.Sub(item.sendat)
+				ctrl.Add(CONG_SUCCESS, item.sendat, rtt)
+
 				// save RTT
-				log.Debug("rttd:", acktime.Sub(item.sentat))
-				s.rtt.AddRTT(acktime.Sub(item.sentat))
+				log.Debug("rttd:", rtt)
+				s.rtt.AddRTT(rtt)
 			}
 
 			// pop from window (vacuum)
@@ -230,15 +236,17 @@ establish:
 				transHead++
 			}
 
-			if nsent < windowSize {
+			if nsent < ctrl.WindowSize() {
 				chQueueSegment = s.chSendFile
+			} else {
+				chQueueSegment = nil
 			}
 
 		case now := <-timer.C:
 			// timer is disabled
 			isTimer = false
 
-			for len(window) > 0 && (window[0].sentat.Add(s.rtt.RTO).Before(now) || window[0].ack) {
+			for len(window) > 0 && (window[0].sendat.Add(s.rtt.RTO).Before(now) || window[0].ack) {
 				// pop item
 				item := window[0]
 				window = window[1:]
@@ -248,14 +256,20 @@ establish:
 					nsent--
 					if !item.segment.IsCompleted() {
 						log.Infof("timeout segment : %v", item)
+						ctrl.Add(CONG_LOSS|CONG_TIMEOUT, item.sendat, 0)
 						// resend
 						sendItem(item.segment)
+					} else {
+						ctrl.Add(CONG_SUCCESS|CONG_NOACK, item.sendat, now.Sub(item.sendat))
 					}
 				}
+				// TODO: backup overflow segments
 			}
 			// restart chQueue
-			if nsent < windowSize {
+			if nsent < ctrl.WindowSize() {
 				chQueueSegment = s.chSendFile
+			} else {
+				chQueueSegment = nil
 			}
 
 			// reactivate timer
@@ -387,12 +401,12 @@ func main() {
 	rtt := newRTTCollecter(30, &DoubleRTO{})
 
 	// sender
-	sender := createSender(ctx, &wg, sendConn, 1500, rtt)
+	sender := createSender(ctx, &wg, sendConn, 1500, rtt, NewSimpleControl(260))
 
 	receiver := createReceiver(ctx, &wg, recvConn, 1500)
 
 	const (
-		filenum = 1
+		filenum = 100
 	)
 	go func() {
 		for i := 0; i < filenum; i++ {
