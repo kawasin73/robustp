@@ -39,6 +39,7 @@ func readThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, segS
 			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
 				select {
 				case <-ctx.Done():
+					log.Info("shutdown read thread")
 					return
 				default:
 					continue
@@ -146,7 +147,7 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info("shutdown sender thread...")
+			log.Info("shutdown sender thread")
 			return
 
 		case ack := <-s.chAck:
@@ -160,7 +161,6 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 			// TODO: not get time everytime
 			acktime := time.Now()
 
-			// TODO: validate trans id
 			for transHead < ack.header.TransId {
 				// TODO: resend
 			}
@@ -172,9 +172,10 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 				window[idxWindow].ack = true
 				nsent--
 
-				// TODO: save RTT
 				item := window[idxWindow]
 				item.segment.Ack(&ack)
+
+				// save RTT
 				log.Debug("rttd:", acktime.Sub(item.sentat))
 				s.rtt.AddRTT(acktime.Sub(item.sentat))
 			}
