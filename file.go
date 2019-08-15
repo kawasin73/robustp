@@ -93,7 +93,7 @@ func (f *FileContext) SaveData(header *Header, buf []byte) error {
 	stateno := int(header.Offset) / int(f.segSize)
 
 	if !f.state[stateno] {
-		copy(f.data[header.Offset:header.Offset+uint32(header.Length-uint16(header.HeaderLength))], buf[header.HeaderLength:])
+		copy(f.data[header.Offset:header.Offset+uint32(header.Length-uint16(header.HeaderLength))], buf[header.HeaderLength:header.Length])
 		f.state[stateno] = true
 		f.ncompleted++
 

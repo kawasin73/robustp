@@ -88,7 +88,7 @@ func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mt
 func (s *Sender) HandleRead(ctx context.Context, buf []byte, header *Header) error {
 	switch header.Type {
 	case TypeACK:
-		partials := ParsePartialAck(buf, header)
+		partials := ParsePartialAck(buf[:header.Length], header)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -312,7 +312,7 @@ func (r *Receiver) HandleRead(ctx context.Context, buf []byte, header *Header) e
 			r.files[header.Fileno] = f
 		}
 		if !f.IsAllCompleted() {
-			if err := f.SaveData(header, buf); err != nil {
+			if err := f.SaveData(header, buf[:header.Length]); err != nil {
 				log.Panic(err)
 			}
 			if f.IsAllCompleted() {
