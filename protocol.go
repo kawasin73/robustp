@@ -13,13 +13,14 @@ const (
 const (
 	IPHeaderLen      = 20
 	UDPHeaderLen     = 8
-	RobustPHeaderLen = 16
+	RobustPHeaderLen = 20
 )
 
 type Header struct {
 	Type         uint8
 	HeaderLength uint8
 	Length       uint16
+	TransId      uint32
 	Fileno       uint32
 	Offset       uint32
 	TotalLength  uint32
@@ -35,8 +36,8 @@ func (h *Header) String() string {
 	default:
 		t = fmt.Sprintf("UNK(%d)", h.Type)
 	}
-	return fmt.Sprintf("{type: %q, headerlen: %d, length: %d, fileno: %d, offset: %d, total: %d}", t,
-		h.HeaderLength, h.Length, h.Fileno, h.Offset, h.TotalLength)
+	return fmt.Sprintf("{type: %q, headerlen: %d, length: %d, transid: %d, fileno: %d, offset: %d, total: %d}", t,
+		h.HeaderLength, h.Length, h.TransId, h.Fileno, h.Offset, h.TotalLength)
 }
 
 func (h *Header) Parse(buf []byte) {
@@ -46,6 +47,7 @@ func (h *Header) Parse(buf []byte) {
 	h.Fileno = binary.BigEndian.Uint32(buf[4:])
 	h.Offset = binary.BigEndian.Uint32(buf[8:])
 	h.TotalLength = binary.BigEndian.Uint32(buf[12:])
+	h.TransId = binary.BigEndian.Uint32(buf[16:])
 }
 
 func (h *Header) Encode(buf []byte) {
@@ -55,6 +57,7 @@ func (h *Header) Encode(buf []byte) {
 	binary.BigEndian.PutUint32(buf[4:], h.Fileno)
 	binary.BigEndian.PutUint32(buf[8:], h.Offset)
 	binary.BigEndian.PutUint32(buf[12:], h.TotalLength)
+	binary.BigEndian.PutUint32(buf[16:], h.TransId)
 }
 
 type PartialAck struct {

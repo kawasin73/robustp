@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	log "github.com/kawasin73/robustp/logger"
+)
 
 type FileContext struct {
 	fileno  uint32
@@ -30,7 +33,7 @@ func newRecvFileContext(header *Header, segSize uint16) *FileContext {
 	}
 }
 
-func (f *FileContext) DataMsg(buf []byte, offset uint32) []byte {
+func (f *FileContext) DataMsg(buf []byte, offset uint32, transId uint32) []byte {
 	header := Header{
 		Type:         TypeDATA,
 		HeaderLength: RobustPHeaderLen,
@@ -38,6 +41,7 @@ func (f *FileContext) DataMsg(buf []byte, offset uint32) []byte {
 		Fileno:       f.fileno,
 		Offset:       offset,
 		TotalLength:  uint32(len(f.data)),
+		TransId:      transId,
 	}
 	size := f.segSize
 	if int(offset)+int(size) > len(f.data) {
@@ -50,7 +54,7 @@ func (f *FileContext) DataMsg(buf []byte, offset uint32) []byte {
 	return buf[:header.Length]
 }
 
-func (f *FileContext) AckMsg(buf []byte) []byte {
+func (f *FileContext) AckMsg(buf []byte, transId uint32) []byte {
 	header := Header{
 		Type:         TypeACK,
 		HeaderLength: RobustPHeaderLen,
@@ -58,6 +62,7 @@ func (f *FileContext) AckMsg(buf []byte) []byte {
 		Fileno:       f.fileno,
 		Offset:       uint32(f.tail * int(f.segSize)),
 		TotalLength:  uint32(len(f.data)),
+		TransId:      transId,
 	}
 
 	i := f.tail
@@ -104,19 +109,17 @@ func (f *FileContext) SaveData(header *Header, buf []byte) error {
 	return nil
 }
 
-func (f *FileContext) AckData(ack *AckMsg) (int, error) {
+func (f *FileContext) AckData(ack *AckMsg) {
 	if f.fileno != ack.header.Fileno {
-		return 0, fmt.Errorf("invalid fileno for save data")
+		log.Panic(fmt.Errorf("invalid fileno for save data"))
 	}
 	stateno := int(ack.header.Offset) / int(f.segSize)
-	var n int
 
 	// update tail stateno
 	if f.tail < stateno {
 		for i := f.tail; i < stateno; i++ {
 			if !f.state[i] {
 				f.state[i] = true
-				n++
 				f.ncompleted++
 			}
 		}
@@ -130,13 +133,10 @@ func (f *FileContext) AckData(ack *AckMsg) (int, error) {
 		for i := uint32(0); i < l; i++ {
 			if !f.state[head+i] {
 				f.state[head+i] = true
-				n++
 				f.ncompleted++
 			}
 		}
 	}
-
-	return n, nil
 }
 
 func (f *FileContext) IsCompleted(offset uint32) bool {
@@ -145,4 +145,21 @@ func (f *FileContext) IsCompleted(offset uint32) bool {
 
 func (f *FileContext) IsAllCompleted() bool {
 	return f.tail == len(f.state)
+}
+
+type FileSegment struct {
+	file   *FileContext
+	offset uint32
+}
+
+func (fs *FileSegment) PackMsg(buf []byte, transId uint32) ([]byte) {
+	return fs.file.DataMsg(buf, fs.offset, transId)
+}
+
+func (fs *FileSegment) Ack(msg *AckMsg) {
+	fs.file.AckData(msg)
+}
+
+func (fs *FileSegment) IsCompleted() bool {
+	return fs.file.IsCompleted(fs.offset)
 }

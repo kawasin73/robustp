@@ -13,15 +13,15 @@ import (
 	log "github.com/kawasin73/robustp/logger"
 )
 
-type WaitItem struct {
-	sentat time.Time
-	fctx   *FileContext
-	offset uint32
+type TransSegment struct {
+	sentat  time.Time
+	segment *FileSegment
+	ack     bool
 }
 
 type Sender struct {
 	segSize    uint16
-	chSendFile chan *FileContext
+	chSendFile chan *FileSegment
 	rtt        *RTTCollecter
 }
 
@@ -30,7 +30,7 @@ func createSender(conn *net.UDPConn, mtu int, rtt *RTTCollecter) *Sender {
 	segSize := uint16(mss - RobustPHeaderLen)
 	s := &Sender{
 		segSize:    segSize,
-		chSendFile: make(chan *FileContext),
+		chSendFile: make(chan *FileSegment),
 		rtt:        rtt,
 	}
 	chAck := make(chan AckMsg)
@@ -68,116 +68,110 @@ func (s *Sender) recvThread(conn *net.UDPConn, chAck chan AckMsg) {
 }
 
 func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
-	var timers []*WaitItem
+	var window []TransSegment
 	buf := make([]byte, RobustPHeaderLen+s.segSize)
 
-	files := make(map[uint32]*FileContext)
 	timer := time.NewTimer(0)
 	timer.Stop()
 
 	var (
-		chQueueFile <-chan *FileContext = s.chSendFile
-		queueFile   *FileContext
-		queueSeqno  int
-		window      = 260
-		nsent       int
+		chQueueSegment <-chan *FileSegment = s.chSendFile
+		transHead      uint32
+		windowSize     = 260
+		nsent          int
 	)
 
-	queueFirst := func() {
-		if queueFile == nil {
-			return
+	sendItem := func(segment *FileSegment) bool {
+		transId := transHead + uint32(len(window))
+		log.Debug("send data:", transId)
+		sendbuf := segment.PackMsg(buf, transId)
+		now := time.Now()
+		_, err := conn.Write(sendbuf)
+		if err != nil {
+			log.Panic(err)
 		}
-		restartTimer := len(timers) == 0
-		for ; queueSeqno < len(queueFile.data) && nsent < window; queueSeqno += int(queueFile.segSize) {
-			sendbuf := queueFile.DataMsg(buf, uint32(queueSeqno))
-			_, err := conn.Write(sendbuf)
-			if err != nil {
-				log.Panic(err)
-				return
-			}
-			now := time.Now()
-			timers = append(timers, &WaitItem{
-				sentat: now,
-				fctx:   queueFile,
-				offset: uint32(queueSeqno),
-			})
-			s.rtt.Send(queueFile.fileno, uint32(queueSeqno), now)
-			nsent++
-		}
-		if queueSeqno >= len(queueFile.data) {
-			// finish to queue all msg in file
-			chQueueFile = s.chSendFile
-			queueFile = nil
-			queueSeqno = 0
-		}
-		if restartTimer && len(timers) > 0 {
-			// reset timer
-			timer.Reset(timers[0].sentat.Add(s.rtt.RTO).Sub(time.Now()))
-		}
+		window = append(window, TransSegment{sentat: now, segment: segment})
+		nsent++
+		return nsent < windowSize
 	}
 
 	for {
 		select {
 		case ack := <-chAck:
 			log.Debug("recv ack : ", ack)
-			f, ok := files[ack.header.Fileno]
-			if !ok {
-				log.Infof("recv ack : fileno %d is not found\n", ack.header.Fileno)
-				continue
+			log.Debug("transHead :", transHead)
+			log.Debug("window size:", len(window))
+			log.Debug("nsent :", nsent)
+			// TODO: validate trans id
+			for transHead < ack.header.TransId {
+				// TODO: resend
 			}
-			if nack, err := f.AckData(&ack); err != nil {
-				log.Panic(fmt.Errorf("recv ack : %v", err))
-			} else {
-				nsent -= nack
+
+			// if transId is valid
+			idxWindow := int(ack.header.TransId) - int(transHead)
+			if idxWindow >= 0 && idxWindow < len(window) && !window[idxWindow].ack {
+				// remove from window
+				window[idxWindow].ack = true
+				nsent--
+
+				// TODO: save RTT
+				item := window[idxWindow]
+				item.segment.Ack(&ack)
 			}
-			// TODO: get time at exactly recv
-			s.rtt.Recv(ack.header.Fileno, ack.header.Offset, time.Now())
-			if f.IsAllCompleted() {
-				log.Infof("send finished fileno %d\n", f.fileno)
-				delete(files, f.fileno)
+
+			// pop from window (vacuum)
+			for len(window) > 0 && window[0].ack {
+				window = window[1:]
+				transHead++
 			}
-			queueFirst()
+
+			// TODO: reset timer
+
+			if nsent < windowSize {
+				chQueueSegment = s.chSendFile
+			}
 
 		case now := <-timer.C:
-			for len(timers) > 0 && timers[0].sentat.Add(s.rtt.RTO).Before(now) {
+			for len(window) > 0 && (window[0].sentat.Add(s.rtt.RTO).Before(now) || window[0].ack) {
 				// pop item
-				item := timers[0]
-				timers = timers[1:]
+				item := window[0]
+				window = window[1:]
+				transHead++
 
-				s.rtt.Remove(item.fctx.fileno, item.offset)
-
-				if !item.fctx.IsCompleted(item.offset) {
-					log.Infof("timeout : fileno: %d, offset: %d", item.fctx.fileno, item.offset)
-					// resend
-					sendbuf := item.fctx.DataMsg(buf, item.offset)
-					_, err := conn.Write(sendbuf)
-					if err != nil {
-						log.Panic(err)
+				if !item.ack {
+					nsent--
+					if !item.segment.IsCompleted() {
+						log.Infof("timeout segment : %v", item)
+						// resend
+						sendItem(item.segment)
 					}
-
-					// re-queue wait item
-					item.sentat = time.Now()
-					timers = append(timers, item)
 				}
 			}
-			if len(timers) > 0 {
+			// restart chQueue
+			if nsent < windowSize {
+				chQueueSegment = s.chSendFile
+			}
+			if len(window) > 0 {
 				// reset timer
-				timer.Reset(timers[0].sentat.Add(s.rtt.RTO).Sub(time.Now()))
+				timer.Reset(window[0].sentat.Add(s.rtt.RTO).Sub(time.Now()))
 			}
 
-		case f := <-chQueueFile:
-			files[f.fileno] = f
-			chQueueFile = nil
-			queueFile = f
-			queueFirst()
+		case segment := <-chQueueSegment:
+			if !sendItem(segment) {
+				chQueueSegment = nil
+			}
 		}
 	}
 }
 
 func (s *Sender) sendFile(i uint32, data []byte) error {
 	f := newSendFileContext(i, data, s.segSize)
-	s.chSendFile <- f
-	log.Debug("queue ", i)
+	for offset := 0; offset < len(f.data); offset += int(f.segSize) {
+		s.chSendFile <- &FileSegment{
+			file:   f,
+			offset: uint32(offset),
+		}
+	}
 	return nil
 }
 
@@ -234,7 +228,7 @@ func (r *Receiver) recvThread(conn *net.UDPConn) {
 					// それ以降に Data が送られて来ないように ACK + FIN によるコネクションを閉じる考え方が必要。
 				}
 			}
-			ackbuf := f.AckMsg(buf)
+			ackbuf := f.AckMsg(buf, header.TransId)
 			if _, err := conn.Write(ackbuf); err != nil {
 				log.Panic(fmt.Errorf("send ack msg : %v", err))
 			}
@@ -247,7 +241,7 @@ func (r *Receiver) recvThread(conn *net.UDPConn) {
 }
 
 func main() {
-	log.SetLevel(log.LvInfo)
+	log.SetLevel(log.LvDebug)
 	go func() {
 		log.Error(http.ListenAndServe("localhost:6060", nil))
 	}()
