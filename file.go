@@ -30,23 +30,23 @@ func newRecvFileContext(header *Header, segSize uint16) *FileContext {
 	}
 }
 
-func (f *FileContext) DataMsg(buf []byte, seqno uint32) []byte {
+func (f *FileContext) DataMsg(buf []byte, offset uint32) []byte {
 	header := Header{
 		Type:         TypeDATA,
 		HeaderLength: RobustPHeaderLen,
 		Length:       0,
 		Fileno:       f.fileno,
-		Seqno:        seqno,
+		Offset:       offset,
 		TotalLength:  uint32(len(f.data)),
 	}
 	size := f.segSize
-	if int(seqno)+int(size) > len(f.data) {
-		size = uint16(len(f.data) - int(seqno))
+	if int(offset)+int(size) > len(f.data) {
+		size = uint16(len(f.data) - int(offset))
 	}
 	header.Length = uint16(header.HeaderLength) + size
 
 	header.Encode(buf)
-	copy(buf[header.HeaderLength:header.Length], f.data[header.Seqno:])
+	copy(buf[header.HeaderLength:header.Length], f.data[header.Offset:])
 	return buf[:header.Length]
 }
 
@@ -56,7 +56,7 @@ func (f *FileContext) AckMsg(buf []byte) []byte {
 		HeaderLength: RobustPHeaderLen,
 		Length:       RobustPHeaderLen,
 		Fileno:       f.fileno,
-		Seqno:        uint32(f.tail * int(f.segSize)),
+		Offset:       uint32(f.tail * int(f.segSize)),
 		TotalLength:  uint32(len(f.data)),
 	}
 
@@ -69,13 +69,13 @@ func (f *FileContext) AckMsg(buf []byte) []byte {
 		// search for first completed segment from tail
 		for ; !f.state[i]; i++ {
 		}
-		seqno := uint32(i) * uint32(f.segSize)
+		offset := uint32(i) * uint32(f.segSize)
 		length := uint32(0)
 		for ; i < len(f.state) && f.state[i]; i++ {
 			length += uint32(f.segSize)
 			nseg++
 		}
-		partials = append(partials, PartialAck{seqno: seqno, length: length})
+		partials = append(partials, PartialAck{offset: offset, length: length})
 	}
 	EncodePartialAck(buf, &header, partials)
 	header.Encode(buf)
@@ -86,10 +86,10 @@ func (f *FileContext) SaveData(header *Header, buf []byte) error {
 	if f.fileno != header.Fileno {
 		return fmt.Errorf("invalid fileno for save data")
 	}
-	stateno := int(header.Seqno) / int(f.segSize)
+	stateno := int(header.Offset) / int(f.segSize)
 
 	if !f.state[stateno] {
-		copy(f.data[header.Seqno:header.Seqno+uint32(header.Length-uint16(header.HeaderLength))], buf[header.HeaderLength:])
+		copy(f.data[header.Offset:header.Offset+uint32(header.Length-uint16(header.HeaderLength))], buf[header.HeaderLength:])
 		f.state[stateno] = true
 		f.ncompleted++
 
@@ -108,7 +108,7 @@ func (f *FileContext) AckData(ack *AckMsg) (int, error) {
 	if f.fileno != ack.header.Fileno {
 		return 0, fmt.Errorf("invalid fileno for save data")
 	}
-	stateno := int(ack.header.Seqno) / int(f.segSize)
+	stateno := int(ack.header.Offset) / int(f.segSize)
 	var n int
 
 	// update tail stateno
@@ -125,7 +125,7 @@ func (f *FileContext) AckData(ack *AckMsg) (int, error) {
 
 	// update partial ack
 	for _, partial := range ack.partials {
-		head := partial.seqno / uint32(f.segSize)
+		head := partial.offset / uint32(f.segSize)
 		l := partial.length / uint32(f.segSize)
 		for i := uint32(0); i < l; i++ {
 			if !f.state[head+i] {
@@ -139,8 +139,8 @@ func (f *FileContext) AckData(ack *AckMsg) (int, error) {
 	return n, nil
 }
 
-func (f *FileContext) IsCompleted(seqno uint32) bool {
-	return f.state[seqno/uint32(f.segSize)]
+func (f *FileContext) IsCompleted(offset uint32) bool {
+	return f.state[offset/uint32(f.segSize)]
 }
 
 func (f *FileContext) IsAllCompleted() bool {

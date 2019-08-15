@@ -16,7 +16,7 @@ import (
 type WaitItem struct {
 	sentat time.Time
 	fctx   *FileContext
-	seqno  uint32
+	offset uint32
 }
 
 type Sender struct {
@@ -99,7 +99,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 			timers = append(timers, &WaitItem{
 				sentat: now,
 				fctx:   queueFile,
-				seqno:  uint32(queueSeqno),
+				offset: uint32(queueSeqno),
 			})
 			s.rtt.Send(queueFile.fileno, uint32(queueSeqno), now)
 			nsent++
@@ -131,7 +131,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 				nsent -= nack
 			}
 			// TODO: get time at exactly recv
-			s.rtt.Recv(ack.header.Fileno, ack.header.Seqno, time.Now())
+			s.rtt.Recv(ack.header.Fileno, ack.header.Offset, time.Now())
 			if f.IsAllCompleted() {
 				log.Infof("send finished fileno %d\n", f.fileno)
 				delete(files, f.fileno)
@@ -144,12 +144,12 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 				item := timers[0]
 				timers = timers[1:]
 
-				s.rtt.Remove(item.fctx.fileno, item.seqno)
+				s.rtt.Remove(item.fctx.fileno, item.offset)
 
-				if !item.fctx.IsCompleted(item.seqno) {
-					log.Infof("timeout : fileno: %d, seqno: %d", item.fctx.fileno, item.seqno)
+				if !item.fctx.IsCompleted(item.offset) {
+					log.Infof("timeout : fileno: %d, offset: %d", item.fctx.fileno, item.offset)
 					// resend
-					sendbuf := item.fctx.DataMsg(buf, item.seqno)
+					sendbuf := item.fctx.DataMsg(buf, item.offset)
 					_, err := conn.Write(sendbuf)
 					if err != nil {
 						log.Panic(err)

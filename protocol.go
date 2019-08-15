@@ -21,7 +21,7 @@ type Header struct {
 	HeaderLength uint8
 	Length       uint16
 	Fileno       uint32
-	Seqno        uint32
+	Offset       uint32
 	TotalLength  uint32
 }
 
@@ -35,8 +35,8 @@ func (h *Header) String() string {
 	default:
 		t = fmt.Sprintf("UNK(%d)", h.Type)
 	}
-	return fmt.Sprintf("{type: %q, headerlen: %d, length: %d, fileno: %d, seqno: %d, total: %d}", t,
-		h.HeaderLength, h.Length, h.Fileno, h.Seqno, h.TotalLength)
+	return fmt.Sprintf("{type: %q, headerlen: %d, length: %d, fileno: %d, offset: %d, total: %d}", t,
+		h.HeaderLength, h.Length, h.Fileno, h.Offset, h.TotalLength)
 }
 
 func (h *Header) Parse(buf []byte) {
@@ -44,7 +44,7 @@ func (h *Header) Parse(buf []byte) {
 	h.HeaderLength = buf[1]
 	h.Length = binary.BigEndian.Uint16(buf[2:])
 	h.Fileno = binary.BigEndian.Uint32(buf[4:])
-	h.Seqno = binary.BigEndian.Uint32(buf[8:])
+	h.Offset = binary.BigEndian.Uint32(buf[8:])
 	h.TotalLength = binary.BigEndian.Uint32(buf[12:])
 }
 
@@ -53,12 +53,12 @@ func (h *Header) Encode(buf []byte) {
 	buf[1] = h.HeaderLength
 	binary.BigEndian.PutUint16(buf[2:], h.Length)
 	binary.BigEndian.PutUint32(buf[4:], h.Fileno)
-	binary.BigEndian.PutUint32(buf[8:], h.Seqno)
+	binary.BigEndian.PutUint32(buf[8:], h.Offset)
 	binary.BigEndian.PutUint32(buf[12:], h.TotalLength)
 }
 
 type PartialAck struct {
-	seqno  uint32
+	offset uint32
 	length uint32
 }
 
@@ -76,9 +76,9 @@ func ParsePartialAck(buf []byte, header *Header) []PartialAck {
 	n := len(buf) / 8
 	acks := make([]PartialAck, n)
 	for i := 0; i < n; i++ {
-		seqno := binary.BigEndian.Uint32(buf)
+		offset := binary.BigEndian.Uint32(buf)
 		length := binary.BigEndian.Uint32(buf[4:])
-		acks[i] = PartialAck{seqno: seqno, length: length}
+		acks[i] = PartialAck{offset: offset, length: length}
 	}
 	return acks
 }
@@ -89,7 +89,7 @@ func EncodePartialAck(buf []byte, header *Header, acks []PartialAck) {
 		if len(buf) < 8 {
 			break
 		}
-		binary.BigEndian.PutUint32(buf, ack.seqno)
+		binary.BigEndian.PutUint32(buf, ack.offset)
 		binary.BigEndian.PutUint32(buf[4:], ack.length)
 		header.Length += 8
 		buf = buf[8:]

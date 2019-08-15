@@ -38,38 +38,38 @@ func newRTTCollecter(window int, rtoCalc RTOCalclater) *RTTCollecter {
 	return rc
 }
 
-func (rc *RTTCollecter) Send(fileno, seqno uint32, t time.Time) {
+func (rc *RTTCollecter) Send(fileno, offset uint32, t time.Time) {
 	file, ok := rc.table[fileno]
 	if !ok {
 		file = make(map[uint32]time.Time)
 		rc.table[fileno] = file
 	}
-	file[seqno] = t
+	file[offset] = t
 }
 
-func (rc *RTTCollecter) Recv(fileno, seqno uint32, t time.Time) {
+func (rc *RTTCollecter) Recv(fileno, offset uint32, t time.Time) {
 	if file, ok := rc.table[fileno]; !ok {
 		return
-	} else if st, ok := file[seqno]; !ok {
+	} else if st, ok := file[offset]; !ok {
 		return
 	} else {
 		rtt := t.Sub(st)
 		rc.addRTT(float64(rtt))
 
 		// remove from table
-		delete(file, seqno)
+		delete(file, offset)
 		if len(file) == 0 {
 			delete(rc.table, fileno)
 		}
 	}
 }
 
-func (rc *RTTCollecter) Remove(fileno, seqno uint32) {
+func (rc *RTTCollecter) Remove(fileno, offset uint32) {
 	if file, ok := rc.table[fileno]; !ok {
 		return
 	} else {
 		// remove from table
-		delete(file, seqno)
+		delete(file, offset)
 		if len(file) == 0 {
 			delete(rc.table, fileno)
 		}
