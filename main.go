@@ -79,7 +79,16 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 		transHead      uint32
 		windowSize     = 260
 		nsent          int
+		isTimer        bool
 	)
+
+	setTimer := func() {
+		if !isTimer && len(window) > 0 {
+			// window[0] must be ack == false
+			timer.Reset(window[0].sentat.Add(s.rtt.RTO).Sub(time.Now()))
+			isTimer = true
+		}
+	}
 
 	sendItem := func(segment *FileSegment) bool {
 		transId := transHead + uint32(len(window))
@@ -90,9 +99,13 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 		if err != nil {
 			log.Panic(err)
 		}
+
+		// add window
 		window = append(window, TransSegment{sentat: now, segment: segment})
 		nsent++
-		// TODO: reactivate timer
+
+		// set timer
+		setTimer()
 		return nsent < windowSize
 	}
 
@@ -124,7 +137,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 				// TODO: save RTT
 				item := window[idxWindow]
 				item.segment.Ack(&ack)
-
+				log.Debug("rttd:", acktime.Sub(item.sentat))
 				s.rtt.AddRTT(acktime.Sub(item.sentat))
 			}
 
@@ -134,13 +147,14 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 				transHead++
 			}
 
-			// TODO: reset timer
-
 			if nsent < windowSize {
 				chQueueSegment = s.chSendFile
 			}
 
 		case now := <-timer.C:
+			// timer is disabled
+			isTimer = false
+
 			for len(window) > 0 && (window[0].sentat.Add(s.rtt.RTO).Before(now) || window[0].ack) {
 				// pop item
 				item := window[0]
@@ -160,10 +174,9 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 			if nsent < windowSize {
 				chQueueSegment = s.chSendFile
 			}
-			if len(window) > 0 {
-				// reset timer
-				timer.Reset(window[0].sentat.Add(s.rtt.RTO).Sub(time.Now()))
-			}
+
+			// reactivate timer
+			setTimer()
 
 		case segment := <-chQueueSegment:
 			if !sendItem(segment) {
