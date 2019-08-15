@@ -92,6 +92,7 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 		}
 		window = append(window, TransSegment{sentat: now, segment: segment})
 		nsent++
+		// TODO: reactivate timer
 		return nsent < windowSize
 	}
 
@@ -102,6 +103,12 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 			log.Debug("transHead :", transHead)
 			log.Debug("window size:", len(window))
 			log.Debug("nsent :", nsent)
+			log.Debug("rto :", s.rtt.RTO)
+			log.Debug("rtt :", s.rtt)
+
+			// TODO: not get time everytime
+			acktime := time.Now()
+
 			// TODO: validate trans id
 			for transHead < ack.header.TransId {
 				// TODO: resend
@@ -117,6 +124,8 @@ func (s *Sender) sendThread(conn *net.UDPConn, chAck chan AckMsg) {
 				// TODO: save RTT
 				item := window[idxWindow]
 				item.segment.Ack(&ack)
+
+				s.rtt.AddRTT(acktime.Sub(item.sentat))
 			}
 
 			// pop from window (vacuum)

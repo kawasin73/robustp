@@ -17,7 +17,6 @@ func (r *DoubleRTO) Update(rtt float64, rttTable []float64) time.Duration {
 }
 
 type RTTCollecter struct {
-	table map[uint32]map[uint32]time.Time
 	rtt   float64
 	RTO   time.Duration
 
@@ -30,7 +29,6 @@ type RTTCollecter struct {
 
 func newRTTCollecter(window int, rtoCalc RTOCalclater) *RTTCollecter {
 	rc := &RTTCollecter{
-		table:    make(map[uint32]map[uint32]time.Time),
 		rttTable: make([]float64, window),
 		rtoCalc:  rtoCalc,
 	}
@@ -38,45 +36,8 @@ func newRTTCollecter(window int, rtoCalc RTOCalclater) *RTTCollecter {
 	return rc
 }
 
-func (rc *RTTCollecter) Send(fileno, offset uint32, t time.Time) {
-	file, ok := rc.table[fileno]
-	if !ok {
-		file = make(map[uint32]time.Time)
-		rc.table[fileno] = file
-	}
-	file[offset] = t
-}
-
-func (rc *RTTCollecter) Recv(fileno, offset uint32, t time.Time) {
-	if file, ok := rc.table[fileno]; !ok {
-		return
-	} else if st, ok := file[offset]; !ok {
-		return
-	} else {
-		rtt := t.Sub(st)
-		rc.addRTT(float64(rtt))
-
-		// remove from table
-		delete(file, offset)
-		if len(file) == 0 {
-			delete(rc.table, fileno)
-		}
-	}
-}
-
-func (rc *RTTCollecter) Remove(fileno, offset uint32) {
-	if file, ok := rc.table[fileno]; !ok {
-		return
-	} else {
-		// remove from table
-		delete(file, offset)
-		if len(file) == 0 {
-			delete(rc.table, fileno)
-		}
-	}
-}
-
-func (rc *RTTCollecter) addRTT(rtt float64) {
+func (rc *RTTCollecter) AddRTT(rttd time.Duration) {
+	rtt := float64(rttd)
 	// queue into rttTable
 	if rc.size < len(rc.rttTable) {
 		rc.rttTable[rc.size] = rtt
