@@ -74,25 +74,29 @@ func NewSegmentEnqueuer(chQueue chan *FileSegment, window *WindowManager) *Segme
 
 func (q *SegmentEnqueuer) Retry(retry []*FileSegment) {
 	q.retryBuffer = append(q.retryBuffer, retry...)
-	if len(q.retryBuffer) > 0 || q.window.RestSize() <= 0 {
-		q.ChQueue = nil
-	} else {
-		q.ChQueue = q.chQueue
-	}
+	// TODO: something smells...
+	q.Touch()
 }
 
 func (q *SegmentEnqueuer) Pop() *FileSegment {
 	if len(q.retryBuffer) == 0 {
+		// TODO: something smells...
+		q.Touch()
 		return nil
 	}
 	segment := q.retryBuffer[0]
 	q.retryBuffer = q.retryBuffer[1:]
+	// TODO: something smells...
+	q.Touch()
+	return segment
+}
+
+func (q *SegmentEnqueuer) Touch() {
 	if len(q.retryBuffer) > 0 || q.window.RestSize() <= 0 {
 		q.ChQueue = nil
 	} else {
 		q.ChQueue = q.chQueue
 	}
-	return segment
 }
 
 type Sender struct {
@@ -207,12 +211,16 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 		if err != nil {
 			log.Panic(err)
 		}
+		s.enqueue.Touch()
 	}
 
 	// start send files
 	for {
-		log.Debug("congestion size:", window.ctrl.WindowSize())
+		log.Point("congestion size:", window.ctrl.WindowSize())
+		log.Debug("window actual size:", len(window.window))
 		log.Debug("nsent :", window.nsent)
+		log.Debug("rest size:", window.RestSize())
+		log.Debug("retry buffer size:", len(s.enqueue.retryBuffer))
 		select {
 		case <-ctx.Done():
 			log.Info("shutdown sender thread")
@@ -227,9 +235,9 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 			} else {
 				log.Debug("no window")
 			}
-			log.Debug("window actual size:", len(window.window))
 			log.Debug("rto :", window.rtt.RTO)
-			log.Debug("rtt :", window.rtt)
+			log.Debug("rtt :", window.rtt.rtt)
+			log.Debug("min rtt :", window.rtt.min)
 
 			if ack.header.Type != TypeACK {
 				log.Info("accept not ACK msg :", ack)
@@ -387,10 +395,12 @@ func main() {
 	dst := flag.String("dst", "localhost:19810", "receiver address")
 	mode := flag.Int("mode", 0, "mode 0: send 100files, 1: send all file")
 	path := flag.String("path", filepath.Join("tmp"), "file path")
+	loglv := flag.String("log", "point", "log level [error info point debug]")
+	cong := flag.String("cong", "vegas", "congestion control algorithm [simple vegas]")
 
 	flag.Parse()
 
-	log.SetLevelStr(os.Getenv("LOG"))
+	log.SetLevelStr(*loglv)
 
 	if *mode == mode100 {
 		go func() {
@@ -425,7 +435,18 @@ func main() {
 	defer cancel()
 
 	rtt := newRTTCollecter(10, &DoubleRTO{})
-	window := NewWindowManager(NewSimpleControl(20), rtt)
+
+	var ctrl CongestionControlAlgorithm
+	switch *cong {
+	case "simple":
+		ctrl = NewSimpleControl(10)
+	case "vegas":
+		ctrl = NewVegasControl(10, rtt, 2, 3.5)
+	default:
+		log.Error("unknown algorithm :", *cong)
+		return
+	}
+	window := NewWindowManager(ctrl, rtt)
 
 	// sender
 	sender := createSender(ctx, &wg, sendConn, 1500, window)

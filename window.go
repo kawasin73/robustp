@@ -92,7 +92,7 @@ func (w *WindowManager) AckSegment(ack *AckMsg) ([]*FileSegment, int, bool) {
 		if !item.ack {
 			w.nsent--
 			if !item.segment.IsCompleted() {
-				log.Debugf("early detect loss segment : %v", &item)
+				log.Pointf("early detect loss segment : %v", &item)
 				w.ctrl.Add(CONG_LOSS|CONG_EARLY, item.sendat, 0)
 				// resend
 				segs = append(segs, item.segment)
@@ -125,7 +125,7 @@ func (w *WindowManager) CheckTimeout(now time.Time) ([]*FileSegment, int) {
 		if !item.ack {
 			w.nsent--
 			if !item.segment.IsCompleted() {
-				log.Debugf("timeout segment : %v", &item)
+				log.Pointf("timeout segment : %v", &item)
 				w.ctrl.Add(CONG_LOSS|CONG_TIMEOUT, item.sendat, 0)
 				// resend
 				segs = append(segs, item.segment)
