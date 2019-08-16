@@ -5,7 +5,7 @@ import (
 	"log"
 )
 
-var loglv = LvDebug
+var loglv = LvInfo
 
 const (
 	LvError = iota + 1
