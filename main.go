@@ -159,7 +159,7 @@ func (w *WindowManager) CheckTimeout(now time.Time) ([]*FileSegment, int) {
 		if !item.ack {
 			w.nsent--
 			if !item.segment.IsCompleted() {
-				log.Infof("timeout segment : %v", item)
+				log.Infof("timeout segment : %v", &item)
 				w.ctrl.Add(CONG_LOSS|CONG_TIMEOUT, item.sendat, 0)
 				// resend
 				segs = append(segs, item.segment)
@@ -274,35 +274,19 @@ func (s *Sender) HandleRead(ctx context.Context, buf []byte, header *Header) err
 	}
 }
 
-func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, window *WindowManager) {
-	defer wg.Done()
-	buf := make([]byte, RobustPHeaderLen+s.segSize)
-
+func waitForEstablish(ctx context.Context, buf []byte, conn *net.UDPConn, chAck chan AckMsg) error {
 	timer := time.NewTimer(10 * time.Millisecond)
-
-	sendSegment := func(segment *FileSegment) {
-		transId := window.Push(segment)
-		log.Debug("send data:", transId)
-		sendbuf := segment.PackMsg(buf, transId)
-		_, err := conn.Write(sendbuf)
-		if err != nil {
-			log.Panic(err)
-		}
-	}
-
-	// wait for connection established
-establish:
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("shutdown sender thread")
 			timer.Stop()
-			return
+			return ctx.Err()
 
-		case <-s.chAck:
+		case <-chAck:
 			// accept ACK_CONN
 			timer.Stop()
-			break establish
+			return nil
 
 		case <-timer.C:
 			// send CONN msg
@@ -320,6 +304,16 @@ establish:
 			timer.Reset(10 * time.Millisecond)
 		}
 	}
+}
+
+func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, window *WindowManager) {
+	defer wg.Done()
+	buf := make([]byte, RobustPHeaderLen+s.segSize)
+
+	// wait for connection established
+	if err := waitForEstablish(ctx, buf, conn, s.chAck); err != nil {
+		log.Panic(err)
+	}
 
 	var (
 		nsuccess, ntimeout, nresend, nnoack int
@@ -331,6 +325,16 @@ establish:
 		log.Infof("sender : resend  segment : %d", nresend)
 		log.Infof("sender : noack   segment : %d", nnoack)
 	}()
+
+	sendSegment := func(segment *FileSegment) {
+		transId := window.Push(segment)
+		log.Debug("send data:", transId)
+		sendbuf := segment.PackMsg(buf, transId)
+		_, err := conn.Write(sendbuf)
+		if err != nil {
+			log.Panic(err)
+		}
+	}
 
 	// start send files
 	for {
@@ -353,6 +357,11 @@ establish:
 			log.Debug("window actual size:", len(window.window))
 			log.Debug("rto :", window.rtt.RTO)
 			log.Debug("rtt :", window.rtt)
+
+			if ack.header.Type != TypeACK {
+				log.Info("accept not ACK msg :", ack)
+				continue
+			}
 
 			retry, ok := window.AckSegment(&ack)
 
@@ -491,7 +500,7 @@ func (r *Receiver) HandleRead(ctx context.Context, buf []byte, header *Header) e
 }
 
 func main() {
-	log.SetLevel(log.LvDebug)
+	log.SetLevel(log.LvInfo)
 	go func() {
 		log.Error(http.ListenAndServe("localhost:6060", nil))
 	}()
