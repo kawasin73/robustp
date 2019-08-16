@@ -341,7 +341,11 @@ func (r *Receiver) HandleRead(ctx context.Context, buf []byte, header *Header) e
 				log.Panic(err)
 			}
 			if f.IsAllCompleted() {
-				r.chRecvFile <- f
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case r.chRecvFile <- f:
+				}
 				// TODO: remove file context
 				// それ以降に Data が送られて来ないように ACK + FIN によるコネクションを閉じる考え方が必要。
 			}
@@ -383,7 +387,6 @@ func main() {
 	dst := flag.String("dst", "localhost:19810", "receiver address")
 	mode := flag.Int("mode", 0, "mode 0: send 100files, 1: send all file")
 	path := flag.String("path", filepath.Join("tmp"), "file path")
-
 
 	flag.Parse()
 
@@ -462,6 +465,9 @@ func main() {
 			if err := ioutil.WriteFile(fmt.Sprintf("tmp/file%d", f.fileno), f.data, os.ModePerm); err != nil {
 				log.Panic(err)
 			}
+
+			// FileContext will not be GCed
+			f.data = nil
 		}
 	} else if *mode == modeAll {
 		log.Info("start all file send mode")
@@ -501,6 +507,9 @@ func main() {
 			}
 			log.Info("file save :", filename)
 			idxrecv++
+
+			// FileContext will not be GCed
+			f.data = nil
 		}
 	} else {
 		log.Error("invalid mode")
