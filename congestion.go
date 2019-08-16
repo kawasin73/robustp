@@ -57,13 +57,11 @@ func (c *VegasControl) Add(status uint8, sendAt time.Time, rtt time.Duration) {
 		cwnd := float64(c.size)
 		diff := (cwnd/c.rtt.min - cwnd/float64(rtt)) * c.rtt.min
 		//logger.Error("diff :", diff)
-		if diff > c.b {
+		if c.size > 1 && diff > c.b {
 			c.size--
 		} else if diff < c.a {
 			c.size++
 		}
-	} else if c.size > 1 {
-		c.size /= 2
 	}
 }
 

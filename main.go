@@ -203,6 +203,7 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 		log.Infof("sender : timeout segment : %d", ntimeout)
 		log.Infof("sender : resend  segment : %d", nresend)
 		log.Infof("sender : noack   segment : %d", nnoack)
+		log.Info("rto :", window.rtt.RTO)
 		log.Info("congestion size:", window.ctrl.WindowSize())
 		log.Info("window actual size:", len(window.window))
 		log.Info("nsent :", window.nsent)
@@ -403,7 +404,7 @@ func (r *Receiver) HandleRead(ctx context.Context, buf []byte, header *Header) e
 }
 
 const (
-	mode10  = 0
+	mode100 = 0
 	modeAll = 1
 )
 
@@ -420,7 +421,7 @@ func main() {
 
 	log.SetLevelStr(*loglv)
 
-	if *mode == mode10 {
+	if *mode == mode100 {
 		go func() {
 			log.Error(http.ListenAndServe("localhost:6060", nil))
 		}()
@@ -471,14 +472,14 @@ func main() {
 
 	receiver := createReceiver(ctx, &wg, recvConn, *mtu)
 
-	if *mode == mode10 {
-		log.Info("start debug mode send 10")
+	if *mode == mode100 {
+		log.Info("start debug mode send 100")
 		data, err := ioutil.ReadFile(filepath.Join(*path, "sample"))
 		if err != nil {
 			log.Panic(err)
 		}
 		const (
-			filenum = 10
+			filenum = 100
 		)
 		go func() {
 			for i := 0; i < filenum; i++ {
