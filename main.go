@@ -522,7 +522,7 @@ func main() {
 		var idxrecv int
 		for {
 			f := <-receiver.chRecvFile
-			filename := filepath.Join(dstpath, fmt.Sprintf("%d.bin", idxrecv))
+			filename := filepath.Join(dstpath, fmt.Sprintf("%d.bin", idxrecv+1))
 			if err := ioutil.WriteFile(filename, f.data, os.ModePerm); err != nil {
 				log.Panic(err)
 			}
