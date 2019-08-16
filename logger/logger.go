@@ -17,6 +17,17 @@ func SetLevel(lv int) {
 	loglv = lv
 }
 
+func SetLevelStr(lv string) {
+	switch lv {
+	case "error":
+		loglv = LvError
+	case "info":
+		loglv = LvInfo
+	case "debug":
+		loglv = LvDebug
+	}
+}
+
 func output(lv int, prefix string, v ...interface{}) {
 	if lv <= loglv {
 		_ = log.Output(3, prefix+fmt.Sprintln(v...))

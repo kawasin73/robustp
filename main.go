@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -112,7 +114,7 @@ func (w *WindowManager) AckSegment(ack *AckMsg) ([]*FileSegment, int, bool) {
 	var (
 		segs  []*FileSegment
 		noack int
-		ok bool
+		ok    bool
 	)
 
 	// if transId is valid
@@ -142,7 +144,7 @@ func (w *WindowManager) AckSegment(ack *AckMsg) ([]*FileSegment, int, bool) {
 		if !item.ack {
 			w.nsent--
 			if !item.segment.IsCompleted() {
-				log.Infof("early detect loss segment : %v", &item)
+				log.Debugf("early detect loss segment : %v", &item)
 				w.ctrl.Add(CONG_LOSS|CONG_EARLY, item.sendat, 0)
 				// resend
 				segs = append(segs, item.segment)
@@ -254,7 +256,7 @@ func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mt
 		segSize: segSize,
 		chQueue: chQueue,
 		enqueue: NewSegmentEnqueuer(chQueue, window),
-		chAck:   make(chan AckMsg),
+		chAck:   make(chan AckMsg, 100),
 	}
 	wg.Add(2)
 	go readThread(ctx, wg, conn, segSize, s)
@@ -462,7 +464,7 @@ func createReceiver(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, 
 	segSize := uint16(mss - RobustPHeaderLen)
 	r := &Receiver{
 		segSize:    segSize,
-		chRecvFile: make(chan *FileContext),
+		chRecvFile: make(chan *FileContext, 100),
 		files:      make(map[uint32]*FileContext),
 		conn:       conn,
 	}
@@ -516,16 +518,33 @@ func (r *Receiver) HandleRead(ctx context.Context, buf []byte, header *Header) e
 	}
 }
 
+const (
+	mode100 = 0
+	modeAll = 1
+)
+
 func main() {
-	log.SetLevel(log.LvDebug)
-	go func() {
-		log.Error(http.ListenAndServe("localhost:6060", nil))
-	}()
-	srcaddr, err := net.ResolveUDPAddr("udp4", "169.254.251.212:19810")
+	src := flag.String("src", "localhost:19809", "sender address")
+	dst := flag.String("dst", "localhost:19810", "receiver address")
+	mode := flag.Int("mode", 0, "mode 0: send 100files, 1: send all file")
+	path := flag.String("path", filepath.Join("tmp"), "file path")
+	loglv := flag.String("log", "info", "log level [error, info, debug]")
+
+	flag.Parse()
+
+	log.SetLevelStr(*loglv)
+
+	if *mode == mode100 {
+		go func() {
+			log.Error(http.ListenAndServe("localhost:6060", nil))
+		}()
+	}
+
+	srcaddr, err := net.ResolveUDPAddr("udp4", *src)
 	if err != nil {
 		log.Panic(err)
 	}
-	destaddr, err := net.ResolveUDPAddr("udp4", "169.254.22.60:19810")
+	destaddr, err := net.ResolveUDPAddr("udp4", *dst)
 	if err != nil {
 		log.Panic(err)
 	}
@@ -542,11 +561,6 @@ func main() {
 	}
 	defer recvConn.Close()
 
-	data, err := ioutil.ReadFile("tmp/sample")
-	if err != nil {
-		log.Panic(err)
-	}
-
 	var wg sync.WaitGroup
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -560,33 +574,81 @@ func main() {
 
 	receiver := createReceiver(ctx, &wg, recvConn, 1500)
 
-	const (
-		filenum = 100
-	)
-	go func() {
-		for i := 0; i < filenum; i++ {
-			sender.sendFile(ctx, uint32(i), data)
-		}
-	}()
-
-	for i := 0; i < filenum; i++ {
-		f := <-receiver.chRecvFile
-		if bytes.Equal(f.data[:], data[:]) {
-			log.Info("same data", f.fileno)
-		} else {
-			log.Info("not same data")
-			log.Debug(f.data[:10])
-			log.Debug(data[:10])
-			log.Debug(f.data[1024:1034])
-			log.Debug(data[1024:1034])
-			log.Debug(f.data[2048:2058])
-			log.Debug(data[2048:2058])
-			log.Debug(f.data[102400-481:])
-			log.Debug(data[102400-481:])
-		}
-		if err := ioutil.WriteFile(fmt.Sprintf("tmp/file%d", f.fileno), f.data, os.ModePerm); err != nil {
+	if *mode == mode100 {
+		log.Info("start debug mode send 100")
+		data, err := ioutil.ReadFile(filepath.Join(*path, "sample"))
+		if err != nil {
 			log.Panic(err)
 		}
+		const (
+			filenum = 100
+		)
+		go func() {
+			for i := 0; i < filenum; i++ {
+				sender.sendFile(ctx, uint32(i), data)
+			}
+		}()
+
+		for i := 0; i < filenum; i++ {
+			f := <-receiver.chRecvFile
+			if bytes.Equal(f.data[:], data[:]) {
+				log.Info("same data", f.fileno)
+			} else {
+				log.Info("not same data", f.fileno)
+				log.Debug(f.data[:10])
+				log.Debug(data[:10])
+				log.Debug(f.data[1024:1034])
+				log.Debug(data[1024:1034])
+				log.Debug(f.data[2048:2058])
+				log.Debug(data[2048:2058])
+				log.Debug(f.data[102400-481:])
+				log.Debug(data[102400-481:])
+			}
+			if err := ioutil.WriteFile(fmt.Sprintf("tmp/file%d", f.fileno), f.data, os.ModePerm); err != nil {
+				log.Panic(err)
+			}
+		}
+	} else if *mode == modeAll {
+		log.Info("start all file send mode")
+
+		// load all data
+		files := make([][]byte, 1000)
+		for i := 0; i < 1000; i++ {
+			data, err := ioutil.ReadFile(filepath.Join(*path, "src", fmt.Sprintf("%d.bin", i+1)))
+			if err != nil {
+				log.Panic(err)
+			}
+			files[i] = data
+		}
+
+		// make dest dir
+		dstpath := filepath.Join(*path, "dst")
+		_ = os.MkdirAll(dstpath, os.ModePerm)
+
+		// send file
+		go func() {
+			var j int
+			for {
+				for i := 0; i < 1000; i++ {
+					sender.sendFile(ctx, uint32(j), files[i])
+					j++
+				}
+			}
+		}()
+
+		// read file
+		var idxrecv int
+		for {
+			f := <-receiver.chRecvFile
+			filename := filepath.Join(dstpath, fmt.Sprintf("%d.bin", idxrecv))
+			if err := ioutil.WriteFile(filename, f.data, os.ModePerm); err != nil {
+				log.Panic(err)
+			}
+			log.Info("file save :", filename)
+			idxrecv++
+		}
+	} else {
+		log.Error("invalid mode")
 	}
 
 	time.Sleep(100 * time.Millisecond)
