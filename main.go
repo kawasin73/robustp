@@ -461,6 +461,8 @@ func main() {
 		ctrl = NewSimpleControl(10)
 	case "vegas":
 		ctrl = NewVegasControl(10, rtt, 2, 3.5)
+	case "vegas2":
+		ctrl = NewVegas2Control(10, rtt, 2, 3.5, 3)
 	default:
 		log.Error("unknown algorithm :", *cong)
 		return

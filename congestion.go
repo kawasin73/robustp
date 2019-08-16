@@ -68,3 +68,44 @@ func (c *VegasControl) Add(status uint8, sendAt time.Time, rtt time.Duration) {
 func (c *VegasControl) WindowSize() int {
 	return c.size
 }
+
+type Vegas2Control struct {
+	size      int
+	rtt       *RTTCollecter
+	a, b      float64
+	lossCount int
+	loss      int
+}
+
+func NewVegas2Control(inital int, rtt *RTTCollecter, a, b float64, loss int) CongestionControlAlgorithm {
+	return &Vegas2Control{
+		size: inital,
+		rtt:  rtt,
+		a:    a,
+		b:    b,
+		loss: loss,
+	}
+}
+
+func (c *Vegas2Control) Add(status uint8, sendAt time.Time, rtt time.Duration) {
+	if status&CONG_SUCCESS != 0 {
+		cwnd := float64(c.size)
+		diff := (cwnd/c.rtt.min - cwnd/float64(rtt)) * c.rtt.min
+		//logger.Error("diff :", diff)
+		if c.size > 1 && diff > c.b {
+			c.size--
+		} else if diff < c.a {
+			c.size++
+		}
+	} else if status&CONG_LOSS != 0 {
+		if c.size > 1 && c.lossCount <= 0 {
+			c.size--
+			c.lossCount = c.loss
+		}
+		c.lossCount--
+	}
+}
+
+func (c *Vegas2Control) WindowSize() int {
+	return c.size
+}
