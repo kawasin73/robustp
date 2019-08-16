@@ -2,7 +2,7 @@ SRCS = main.go file.go rto.go protocol.go congestion.go window.go
 SRC_ADDR = 169.254.251.212:19817
 DST_ADDR = 169.254.22.60:19817
 CMD = ./robustp
-LOG = info
+LOG = point
 CONG = vegas
 MTU = 1500
 OPTS = -log=$(LOG) -cong=$(CONG) -mtu=$(MTU)

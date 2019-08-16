@@ -84,7 +84,7 @@ func (w *WindowManager) AckSegment(ack *AckMsg) ([]*FileSegment, int, bool) {
 		w.rtt.AddRTT(rtt)
 	}
 
-	for w.transHead < ack.header.TransId {
+	for len(w.window) > 0 && w.transHead < ack.header.TransId {
 		item := w.window[0]
 		w.window = w.window[1:]
 		w.transHead++

@@ -198,11 +198,20 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 		nsuccess, ntimeout, nresend, nnoack int
 	)
 
-	defer func() {
+	report := func() {
 		log.Infof("sender : success segment : %d", nsuccess)
 		log.Infof("sender : timeout segment : %d", ntimeout)
 		log.Infof("sender : resend  segment : %d", nresend)
 		log.Infof("sender : noack   segment : %d", nnoack)
+		log.Info("congestion size:", window.ctrl.WindowSize())
+		log.Info("window actual size:", len(window.window))
+		log.Info("nsent :", window.nsent)
+		log.Info("rest size:", window.RestSize())
+		log.Info("retry buffer size:", len(s.enqueue.retryBuffer))
+	}
+
+	defer func() {
+		report()
 	}()
 
 	sendSegment := func(segment *FileSegment) {
@@ -216,9 +225,11 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 		s.enqueue.Touch()
 	}
 
+	reportTick := time.NewTicker(5 * time.Second)
+
 	// start send files
 	for {
-		log.Point("congestion size:", window.ctrl.WindowSize())
+		log.Debug("congestion size:", window.ctrl.WindowSize())
 		log.Debug("window actual size:", len(window.window))
 		log.Debug("nsent :", window.nsent)
 		log.Debug("rest size:", window.RestSize())
@@ -226,7 +237,11 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 		select {
 		case <-ctx.Done():
 			log.Info("shutdown sender thread")
+			reportTick.Stop()
 			return
+
+		case <-reportTick.C:
+			report()
 
 		case ack := <-s.chAck:
 			// debug log
