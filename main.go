@@ -107,16 +107,13 @@ func (w *WindowManager) Push(segment *FileSegment) uint32 {
 	return transId
 }
 
-func (w *WindowManager) AckSegment(ack *AckMsg) ([]*FileSegment, bool) {
+func (w *WindowManager) AckSegment(ack *AckMsg) ([]*FileSegment, int, bool) {
 	acktime := time.Now()
-	var segs []*FileSegment
-
-	//for w.transHead < ack.header.TransId {
-	//	// TODO: resend append retry buffer
-	//	//ctrl.Add(CONG_LOSS|CONG_EARLY, item.sendat, 0)
-	//}
-
-	var ok bool
+	var (
+		segs  []*FileSegment
+		noack int
+		ok bool
+	)
 
 	// if transId is valid
 	idxWindow := int(ack.header.TransId) - int(w.transHead)
@@ -137,13 +134,32 @@ func (w *WindowManager) AckSegment(ack *AckMsg) ([]*FileSegment, bool) {
 		w.rtt.AddRTT(rtt)
 	}
 
+	for w.transHead < ack.header.TransId {
+		item := w.window[0]
+		w.window = w.window[1:]
+		w.transHead++
+
+		if !item.ack {
+			w.nsent--
+			if !item.segment.IsCompleted() {
+				log.Infof("early detect loss segment : %v", &item)
+				w.ctrl.Add(CONG_LOSS|CONG_EARLY, item.sendat, 0)
+				// resend
+				segs = append(segs, item.segment)
+			} else {
+				noack++
+				w.ctrl.Add(CONG_SUCCESS|CONG_NOACK, item.sendat, acktime.Sub(item.sendat))
+			}
+		}
+	}
+
 	// pop from window (vacuum)
 	for len(w.window) > 0 && w.window[0].ack {
 		w.window = w.window[1:]
 		w.transHead++
 	}
 
-	return segs, ok
+	return segs, noack, ok
 }
 
 func (w *WindowManager) CheckTimeout(now time.Time) ([]*FileSegment, int) {
@@ -159,7 +175,7 @@ func (w *WindowManager) CheckTimeout(now time.Time) ([]*FileSegment, int) {
 		if !item.ack {
 			w.nsent--
 			if !item.segment.IsCompleted() {
-				log.Infof("timeout segment : %v", &item)
+				log.Debugf("timeout segment : %v", &item)
 				w.ctrl.Add(CONG_LOSS|CONG_TIMEOUT, item.sendat, 0)
 				// resend
 				segs = append(segs, item.segment)
@@ -363,13 +379,14 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 				continue
 			}
 
-			retry, ok := window.AckSegment(&ack)
+			retry, noack, ok := window.AckSegment(&ack)
 
 			// for statistics
 			if ok {
 				nsuccess++
 			}
 			nresend += len(retry)
+			nnoack += noack
 
 			for window.RestSize() > 0 {
 				if segment := s.enqueue.Pop(); segment != nil {
@@ -500,7 +517,7 @@ func (r *Receiver) HandleRead(ctx context.Context, buf []byte, header *Header) e
 }
 
 func main() {
-	log.SetLevel(log.LvInfo)
+	log.SetLevel(log.LvDebug)
 	go func() {
 		log.Error(http.ListenAndServe("localhost:6060", nil))
 	}()
@@ -535,8 +552,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rtt := newRTTCollecter(30, &DoubleRTO{})
-	window := NewWindowManager(NewSimpleControl(10000), rtt)
+	rtt := newRTTCollecter(10, &DoubleRTO{})
+	window := NewWindowManager(NewSimpleControl(20), rtt)
 
 	// sender
 	sender := createSender(ctx, &wg, sendConn, 1500, window)
