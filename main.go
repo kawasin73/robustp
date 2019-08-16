@@ -21,6 +21,10 @@ type TransSegment struct {
 	ack     bool
 }
 
+func (s *TransSegment) String() string {
+	return fmt.Sprintf("{sendat: %v, segment: %v, ack: %v}", s.sendat.Format(time.RFC3339Nano), s.segment, s.ack)
+}
+
 type ReadHandler interface {
 	HandleRead(ctx context.Context, buf []byte, header *Header) error
 }
@@ -62,26 +66,183 @@ func readThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, segS
 	}
 }
 
+type WindowManager struct {
+	window    []TransSegment
+	ctrl      CongestionControlAlgorithm
+	transHead uint32
+	nsent     int
+	ChTimer   chan time.Time
+	timer     *time.Timer
+	isTimer   bool
+	rtt       *RTTCollecter
+}
+
+func NewWindowManager(ctrl CongestionControlAlgorithm, rtt *RTTCollecter) *WindowManager {
+	// init timer
+	timer := time.NewTimer(0)
+	timer.Stop()
+	select {
+	case <-timer.C:
+	default:
+	}
+	return &WindowManager{
+		ctrl:  ctrl,
+		timer: timer,
+		rtt:   rtt,
+	}
+}
+
+func (w *WindowManager) Push(segment *FileSegment) uint32 {
+	transId := w.transHead + uint32(len(w.window))
+	now := time.Now()
+
+	// add window
+	w.window = append(w.window, TransSegment{sendat: now, segment: segment})
+	w.nsent++
+
+	if !w.isTimer {
+		w.timer.Reset(w.rtt.RTO)
+		w.isTimer = true
+	}
+	return transId
+}
+
+func (w *WindowManager) AckSegment(ack *AckMsg) ([]*FileSegment, bool) {
+	acktime := time.Now()
+	var segs []*FileSegment
+
+	//for w.transHead < ack.header.TransId {
+	//	// TODO: resend append retry buffer
+	//	//ctrl.Add(CONG_LOSS|CONG_EARLY, item.sendat, 0)
+	//}
+
+	var ok bool
+
+	// if transId is valid
+	idxWindow := int(ack.header.TransId) - int(w.transHead)
+	if idxWindow >= 0 && idxWindow < len(w.window) && !w.window[idxWindow].ack {
+		// remove from window
+		w.window[idxWindow].ack = true
+		w.nsent--
+		ok = true
+
+		item := w.window[idxWindow]
+		item.segment.Ack(ack)
+
+		rtt := acktime.Sub(item.sendat)
+		w.ctrl.Add(CONG_SUCCESS, item.sendat, rtt)
+
+		// save RTT
+		log.Debug("rttd:", rtt)
+		w.rtt.AddRTT(rtt)
+	}
+
+	// pop from window (vacuum)
+	for len(w.window) > 0 && w.window[0].ack {
+		w.window = w.window[1:]
+		w.transHead++
+	}
+
+	return segs, ok
+}
+
+func (w *WindowManager) CheckTimeout(now time.Time) ([]*FileSegment, int) {
+	var noack int
+	w.isTimer = false
+
+	var segs []*FileSegment
+	for len(w.window) > 0 && (w.window[0].sendat.Add(w.rtt.RTO).Before(now) || w.window[0].ack) {
+		item := w.window[0]
+		w.window = w.window[1:]
+		w.transHead++
+
+		if !item.ack {
+			w.nsent--
+			if !item.segment.IsCompleted() {
+				log.Infof("timeout segment : %v", item)
+				w.ctrl.Add(CONG_LOSS|CONG_TIMEOUT, item.sendat, 0)
+				// resend
+				segs = append(segs, item.segment)
+			} else {
+				noack++
+				w.ctrl.Add(CONG_SUCCESS|CONG_NOACK, item.sendat, now.Sub(item.sendat))
+			}
+		}
+	}
+
+	// reactivate timer
+	if len(w.window) > 0 {
+		// window[0] must be ack == false
+		w.timer.Reset(w.window[0].sendat.Add(w.rtt.RTO).Sub(time.Now()))
+		w.isTimer = true
+	}
+
+	return segs, noack
+}
+
+func (w *WindowManager) RestSize() int {
+	return w.ctrl.WindowSize() - w.nsent
+}
+
+type SegmentEnqueuer struct {
+	chQueue     chan *FileSegment
+	ChQueue     chan *FileSegment
+	retryBuffer []*FileSegment
+	window      *WindowManager
+}
+
+func NewSegmentEnqueuer(chQueue chan *FileSegment, window *WindowManager) *SegmentEnqueuer {
+	return &SegmentEnqueuer{
+		chQueue: chQueue,
+		ChQueue: chQueue,
+		window:  window,
+	}
+}
+
+func (q *SegmentEnqueuer) Retry(retry []*FileSegment) {
+	q.retryBuffer = append(q.retryBuffer, retry...)
+	if len(q.retryBuffer) > 0 || q.window.RestSize() <= 0 {
+		q.ChQueue = nil
+	} else {
+		q.ChQueue = q.chQueue
+	}
+}
+
+func (q *SegmentEnqueuer) Pop() *FileSegment {
+	if len(q.retryBuffer) == 0 {
+		return nil
+	}
+	segment := q.retryBuffer[0]
+	q.retryBuffer = q.retryBuffer[1:]
+	if len(q.retryBuffer) > 0 || q.window.RestSize() <= 0 {
+		q.ChQueue = nil
+	} else {
+		q.ChQueue = q.chQueue
+	}
+	return segment
+}
+
 type Sender struct {
 	segSize     uint16
-	chSendFile  chan *FileSegment
 	chAck       chan AckMsg
-	rtt         *RTTCollecter
+	chQueue     chan *FileSegment
+	enqueue     *SegmentEnqueuer
 	established bool
 }
 
-func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mtu int, rtt *RTTCollecter, ctrl CongestionControlAlgorithm) *Sender {
+func createSender(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, mtu int, window *WindowManager) *Sender {
 	mss := uint16(mtu - IPHeaderLen - UDPHeaderLen)
 	segSize := uint16(mss - RobustPHeaderLen)
+	chQueue := make(chan *FileSegment, 100)
 	s := &Sender{
-		segSize:    segSize,
-		chSendFile: make(chan *FileSegment),
-		chAck:      make(chan AckMsg),
-		rtt:        rtt,
+		segSize: segSize,
+		chQueue: chQueue,
+		enqueue: NewSegmentEnqueuer(chQueue, window),
+		chAck:   make(chan AckMsg),
 	}
 	wg.Add(2)
 	go readThread(ctx, wg, conn, segSize, s)
-	go s.sendThread(ctx, wg, conn, ctrl)
+	go s.sendThread(ctx, wg, conn, window)
 	return s
 }
 
@@ -113,45 +274,20 @@ func (s *Sender) HandleRead(ctx context.Context, buf []byte, header *Header) err
 	}
 }
 
-func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, ctrl CongestionControlAlgorithm) {
+func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.UDPConn, window *WindowManager) {
 	defer wg.Done()
-	var window []TransSegment
 	buf := make([]byte, RobustPHeaderLen+s.segSize)
 
 	timer := time.NewTimer(10 * time.Millisecond)
 
-	var (
-		chQueueSegment <-chan *FileSegment = s.chSendFile
-		transHead      uint32
-		nsent          int
-		isTimer        bool
-	)
-
-	setTimer := func() {
-		if !isTimer && len(window) > 0 {
-			// window[0] must be ack == false
-			timer.Reset(window[0].sendat.Add(s.rtt.RTO).Sub(time.Now()))
-			isTimer = true
-		}
-	}
-
-	sendItem := func(segment *FileSegment) bool {
-		transId := transHead + uint32(len(window))
+	sendSegment := func(segment *FileSegment) {
+		transId := window.Push(segment)
 		log.Debug("send data:", transId)
 		sendbuf := segment.PackMsg(buf, transId)
-		now := time.Now()
 		_, err := conn.Write(sendbuf)
 		if err != nil {
 			log.Panic(err)
 		}
-
-		// add window
-		window = append(window, TransSegment{sendat: now, segment: segment})
-		nsent++
-
-		// set timer
-		setTimer()
-		return nsent < ctrl.WindowSize()
 	}
 
 	// wait for connection established
@@ -185,110 +321,102 @@ establish:
 		}
 	}
 
+	var (
+		nsuccess, ntimeout, nresend, nnoack int
+	)
+
+	defer func() {
+		log.Infof("sender : success segment : %d", nsuccess)
+		log.Infof("sender : timeout segment : %d", ntimeout)
+		log.Infof("sender : resend  segment : %d", nresend)
+		log.Infof("sender : noack   segment : %d", nnoack)
+	}()
+
 	// start send files
 	for {
-		log.Debug("congestion size:", ctrl.WindowSize())
+		log.Debug("congestion size:", window.ctrl.WindowSize())
+		log.Debug("nsent :", window.nsent)
 		select {
 		case <-ctx.Done():
 			log.Info("shutdown sender thread")
-			timer.Stop()
 			return
 
 		case ack := <-s.chAck:
+			// debug log
 			log.Debug("recv ack : ", &ack)
-			log.Debug("transHead :", transHead)
-			log.Debug("window size:", len(window))
-			log.Debug("nsent :", nsent)
-			log.Debug("rto :", s.rtt.RTO)
-			log.Debug("rtt :", s.rtt)
-
-			// TODO: not get time everytime
-			acktime := time.Now()
-
-			for transHead < ack.header.TransId {
-				// TODO: resend
-				//ctrl.Add(CONG_LOSS|CONG_EARLY, item.sendat, 0)
-			}
-
-			// TODO: backup overflow segments
-
-			// if transId is valid
-			idxWindow := int(ack.header.TransId) - int(transHead)
-			if idxWindow >= 0 && idxWindow < len(window) && !window[idxWindow].ack {
-				// remove from window
-				window[idxWindow].ack = true
-				nsent--
-
-				item := window[idxWindow]
-				item.segment.Ack(&ack)
-
-				rtt := acktime.Sub(item.sendat)
-				ctrl.Add(CONG_SUCCESS, item.sendat, rtt)
-
-				// save RTT
-				log.Debug("rttd:", rtt)
-				s.rtt.AddRTT(rtt)
-			}
-
-			// pop from window (vacuum)
-			for len(window) > 0 && window[0].ack {
-				window = window[1:]
-				transHead++
-			}
-
-			if nsent < ctrl.WindowSize() {
-				chQueueSegment = s.chSendFile
+			log.Debug("transHead :", window.transHead)
+			if len(window.window) > 0 {
+				log.Debug("window head :", &window.window[0])
 			} else {
-				chQueueSegment = nil
+				log.Debug("no window")
 			}
+			log.Debug("window actual size:", len(window.window))
+			log.Debug("rto :", window.rtt.RTO)
+			log.Debug("rtt :", window.rtt)
 
-		case now := <-timer.C:
-			// timer is disabled
-			isTimer = false
+			retry, ok := window.AckSegment(&ack)
 
-			for len(window) > 0 && (window[0].sendat.Add(s.rtt.RTO).Before(now) || window[0].ack) {
-				// pop item
-				item := window[0]
-				window = window[1:]
-				transHead++
+			// for statistics
+			if ok {
+				nsuccess++
+			}
+			nresend += len(retry)
 
-				if !item.ack {
-					nsent--
-					if !item.segment.IsCompleted() {
-						log.Infof("timeout segment : %v", item)
-						ctrl.Add(CONG_LOSS|CONG_TIMEOUT, item.sendat, 0)
-						// resend
-						sendItem(item.segment)
-					} else {
-						ctrl.Add(CONG_SUCCESS|CONG_NOACK, item.sendat, now.Sub(item.sendat))
-					}
+			for window.RestSize() > 0 {
+				if segment := s.enqueue.Pop(); segment != nil {
+					sendSegment(segment)
+				} else {
+					break
 				}
-				// TODO: backup overflow segments
-			}
-			// restart chQueue
-			if nsent < ctrl.WindowSize() {
-				chQueueSegment = s.chSendFile
-			} else {
-				chQueueSegment = nil
 			}
 
-			// reactivate timer
-			setTimer()
-
-		case segment := <-chQueueSegment:
-			if !sendItem(segment) {
-				chQueueSegment = nil
+			for ; len(retry) > 0 && window.RestSize() > 0; retry = retry[1:] {
+				// resend
+				sendSegment(retry[0])
 			}
+
+			if len(retry) > 0 {
+				s.enqueue.Retry(retry)
+				log.Debugf("window size shrink and segments overflow. retry: %d, window: %d", len(retry), window.ctrl.WindowSize())
+			}
+
+		case now := <-window.timer.C:
+			retry, noack := window.CheckTimeout(now)
+
+			// for statistics
+			nnoack += noack
+			ntimeout += len(retry)
+
+			for window.RestSize() > 0 {
+				if segment := s.enqueue.Pop(); segment != nil {
+					sendSegment(segment)
+				} else {
+					break
+				}
+			}
+
+			for ; len(retry) > 0 && window.RestSize() > 0; retry = retry[1:] {
+				sendSegment(retry[0])
+			}
+
+			if len(retry) > 0 {
+				s.enqueue.Retry(retry)
+				log.Debugf("window size shrink and segments overflow. retry: %d, window: %d", window.ctrl.WindowSize())
+			}
+
+		case segment := <-s.enqueue.ChQueue:
+			sendSegment(segment)
 		}
 	}
 }
 
-func (s *Sender) sendFile(i uint32, data []byte) error {
+func (s *Sender) sendFile(ctx context.Context, i uint32, data []byte) error {
 	f := newSendFileContext(i, data, s.segSize)
 	for offset := 0; offset < len(f.data); offset += int(f.segSize) {
-		s.chSendFile <- &FileSegment{
-			file:   f,
-			offset: uint32(offset),
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case s.chQueue <- &FileSegment{file: f, offset: uint32(offset)}:
 		}
 	}
 	return nil
@@ -367,11 +495,11 @@ func main() {
 	go func() {
 		log.Error(http.ListenAndServe("localhost:6060", nil))
 	}()
-	srcaddr, err := net.ResolveUDPAddr("udp4", "localhost:19809")
+	srcaddr, err := net.ResolveUDPAddr("udp4", "169.254.251.212:19810")
 	if err != nil {
 		log.Panic(err)
 	}
-	destaddr, err := net.ResolveUDPAddr("udp4", "localhost:19810")
+	destaddr, err := net.ResolveUDPAddr("udp4", "169.254.22.60:19810")
 	if err != nil {
 		log.Panic(err)
 	}
@@ -399,9 +527,10 @@ func main() {
 	defer cancel()
 
 	rtt := newRTTCollecter(30, &DoubleRTO{})
+	window := NewWindowManager(NewSimpleControl(10000), rtt)
 
 	// sender
-	sender := createSender(ctx, &wg, sendConn, 1500, rtt, NewSimpleControl(260))
+	sender := createSender(ctx, &wg, sendConn, 1500, window)
 
 	receiver := createReceiver(ctx, &wg, recvConn, 1500)
 
@@ -410,7 +539,7 @@ func main() {
 	)
 	go func() {
 		for i := 0; i < filenum; i++ {
-			sender.sendFile(uint32(i), data)
+			sender.sendFile(ctx, uint32(i), data)
 		}
 	}()
 

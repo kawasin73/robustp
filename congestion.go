@@ -27,7 +27,7 @@ func (c *SimpleControl) Add(status uint8, sendAt time.Time, rtt time.Duration) {
 	if status&CONG_SUCCESS != 0 {
 		c.size++
 	} else if c.size > 1 {
-		c.size--
+		c.size /= 2
 	}
 }
 
