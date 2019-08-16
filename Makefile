@@ -4,7 +4,8 @@ DST_ADDR = 169.254.22.60:19817
 CMD = ./robustp
 LOG = info
 CONG = vegas
-OPTS = -log=$(LOG) -cong=$(CONG)
+MTU = 1500
+OPTS = -log=$(LOG) -cong=$(CONG) -mtu=$(MTU)
 
 run: robustp
 	time $(CMD) -src=$(SRC_ADDR) -dst=$(DST_ADDR) $(OPTS)

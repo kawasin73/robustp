@@ -192,6 +192,8 @@ func (s *Sender) sendThread(ctx context.Context, wg *sync.WaitGroup, conn *net.U
 		log.Panic(err)
 	}
 
+	log.Info("connection established")
+
 	var (
 		nsuccess, ntimeout, nresend, nnoack int
 	)
@@ -386,7 +388,7 @@ func (r *Receiver) HandleRead(ctx context.Context, buf []byte, header *Header) e
 }
 
 const (
-	mode100 = 0
+	mode10  = 0
 	modeAll = 1
 )
 
@@ -397,12 +399,13 @@ func main() {
 	path := flag.String("path", filepath.Join("tmp"), "file path")
 	loglv := flag.String("log", "point", "log level [error info point debug]")
 	cong := flag.String("cong", "vegas", "congestion control algorithm [simple vegas]")
+	mtu := flag.Int("mtu", 1500, "MTU size")
 
 	flag.Parse()
 
 	log.SetLevelStr(*loglv)
 
-	if *mode == mode100 {
+	if *mode == mode10 {
 		go func() {
 			log.Error(http.ListenAndServe("localhost:6060", nil))
 		}()
@@ -449,18 +452,18 @@ func main() {
 	window := NewWindowManager(ctrl, rtt)
 
 	// sender
-	sender := createSender(ctx, &wg, sendConn, 1500, window)
+	sender := createSender(ctx, &wg, sendConn, *mtu, window)
 
-	receiver := createReceiver(ctx, &wg, recvConn, 1500)
+	receiver := createReceiver(ctx, &wg, recvConn, *mtu)
 
-	if *mode == mode100 {
-		log.Info("start debug mode send 100")
+	if *mode == mode10 {
+		log.Info("start debug mode send 10")
 		data, err := ioutil.ReadFile(filepath.Join(*path, "sample"))
 		if err != nil {
 			log.Panic(err)
 		}
 		const (
-			filenum = 100
+			filenum = 10
 		)
 		go func() {
 			for i := 0; i < filenum; i++ {
